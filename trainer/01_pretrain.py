@@ -21,6 +21,7 @@ from trainer.train_utils import (
     load_checkpoint,
     log,
     save_checkpoint,
+    save_model_only,
     set_seed,
 )
 
@@ -37,11 +38,9 @@ def parse_args():
     # model
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_hidden_layers", type=int, default=12)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument("--num_kv_heads", type=int, default=2)
     parser.add_argument("--use_engrams", type=int, default=0, choices=[0, 1], help="Enable engram blocks")
     parser.add_argument("--engram_vocab_size", type=int, default=1024, help="Engram block vocab size (if use_engrams=1)")
-    parser.add_argument("--self_attn", type=int, default=1, choices=[0, 1], help="Enable self-attention in transformer blocks")
+    parser.add_argument("--embed_max_length", type=int, default=2048, help="Maximum position embedding length (should be >= max_length)")
 
     # train
     parser.add_argument("--epochs", type=int, default=1)
@@ -60,8 +59,8 @@ def parse_args():
     # output/resume
     parser.add_argument("--save_dir", type=str, default="./out")
     parser.add_argument("--save_name", type=str, default="minigram_pretrain")
-    parser.add_argument("--save_interval", type=int, default=1000, help="Save every N optimizer steps")
-    parser.add_argument("--log_interval", type=int, default=100, help="Log every N optimizer steps")
+    parser.add_argument("--save_interval", type=int, default=1000, help="Save every N micro-batches")
+    parser.add_argument("--log_interval", type=int, default=100, help="Log every N micro-batches")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to .pth checkpoint")
 
     # runtime
@@ -79,8 +78,6 @@ def _normalize_resume_step(step_state):
 def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
-    args.log_interval = max(1, args.log_interval)
-    args.save_interval = max(1, args.save_interval)
 
     device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if "cuda" in device else "cpu"
@@ -115,14 +112,13 @@ def main():
         vocab_size=len(tokenizer),
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.num_attention_heads,
-        num_kv_heads=args.num_kv_heads,
-        max_length=args.max_length,
+        max_length=args.embed_max_length,
         use_engrams=bool(args.use_engrams),
         use_cache=False,
-        flash_attention=bool(args.self_attn),
+        flash_attention=True if device_type == "cuda" else False,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        # Edit Engram defaults/behavior in model/model_minigram.py rather than expanding trainer CLI args.
         engram_vocab_size=args.engram_vocab_size if args.use_engrams else None,
     )
     model = MiniGramForCausalLM(lm_config).to(device)
@@ -134,8 +130,6 @@ def main():
         "Model size: "
         f"total={param_info['total_params_human']} ({param_info['total_params']}) "
         f"trainable={param_info['trainable_params_human']} ({param_info['trainable_params']}) "
-        f"param_mem={param_info['param_bytes_human']} "
-        f"buffer_mem={param_info['buffer_bytes_human']}"
     )
 
     optimizer = optim.AdamW(
@@ -145,13 +139,15 @@ def main():
     )
     autocast_ctx, scaler = build_amp(args.dtype, device_type)
 
-    updates_per_epoch = math.ceil(len(train_loader) / max(1, args.accumulation_steps))
-    total_updates = max(1, args.epochs * updates_per_epoch)
-    warmup_steps = int(total_updates * max(0.0, min(1.0, args.warmup_ratio)))
+    steps_per_epoch = len(train_loader)
+    total_steps = max(1, args.epochs * steps_per_epoch)
+    warmup_steps = int(total_steps * max(0.0, min(1.0, args.warmup_ratio)))
 
-    latest_ckpt = os.path.join(args.save_dir, f"{args.save_name}.pth")
+    latest_ckpt = os.path.join(args.save_dir, f"checkpoint/{args.save_name}.pth")
+    out_path = os.path.join(args.save_dir, f"{args.save_name}.pth")
     start_epoch = 0
     resume_batch_step = 0
+    resume_step = 0
     global_step = 0
     best_loss = None
 
@@ -166,23 +162,25 @@ def main():
             "Resumed from checkpoint "
             f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_batch_step})"
         )
+        resume_step = global_step
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    log_start = time.time()
-    total_tokens_since_log = 0
-    train_tokens_since_log = 0
+    global_start = time.time()
 
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx < resume_batch_step:
                 continue
 
+            global_step += 1
+            lr = get_lr(global_step, total_steps, args.learning_rate, warmup_steps, args.min_lr)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
             input_ids, labels = batch
-            train_tokens_since_log += int((labels != -100).sum().item())
             input_ids = input_ids.to(device, non_blocking=pin_memory)
             labels = labels.to(device, non_blocking=pin_memory)
-            total_tokens_since_log += input_ids.numel()
 
             with autocast_ctx():
                 outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
@@ -198,15 +196,10 @@ def main():
             scaler.scale(loss).backward()
 
             should_step = ((batch_idx + 1) % max(1, args.accumulation_steps) == 0) or (
-                (batch_idx + 1) == len(train_loader)
+                global_step == total_steps
             )
             if not should_step:
                 continue
-
-            global_step += 1
-            lr = get_lr(global_step, total_updates, args.learning_rate, warmup_steps, args.min_lr)
-            for group in optimizer.param_groups:
-                group["lr"] = lr
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -220,22 +213,22 @@ def main():
             if best_loss is None or total_loss_value < best_loss:
                 best_loss = total_loss_value
 
-            if global_step % args.log_interval == 0:
-                elapsed = max(time.time() - log_start, 1e-6)
-                all_tokens_per_sec = total_tokens_since_log / elapsed
-                train_tokens_per_sec = train_tokens_since_log / elapsed
+            current_time = time.time()
+            used_time = current_time - global_start
+            remaining_steps = max(0, total_steps - global_step)
+            remaining_time = remaining_steps * (used_time / max(1, global_step - resume_step))
+
+            if (global_step % args.log_interval == 0 or global_step == total_steps) and batch_idx > 0:
                 log(
-                    f"epoch={epoch + 1}/{args.epochs} step={global_step}/{total_updates} "
+                    f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps}) "
                     f"loss={total_loss_value:.4f} logits_loss={logits_loss_value:.4f} "
                     f"aux_loss={aux_loss_value:.4f} lr={lr:.7f} "
-                    f"all_tok/s={all_tokens_per_sec:.1f} train_tok/s={train_tokens_per_sec:.1f}"
+                    f"eta={remaining_time / 60:.2f}min"
                 )
-                log_start = time.time()
-                total_tokens_since_log = 0
-                train_tokens_since_log = 0
 
-            if global_step % args.save_interval == 0:
+            if (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
                 step_state = {"global_step": global_step, "epoch_step": batch_idx + 1}
+                save_model_only(out_path, model=model)
                 save_checkpoint(
                     latest_ckpt,
                     model=model,
@@ -246,35 +239,13 @@ def main():
                     args=args,
                     best_loss=best_loss,
                 )
-                log(f"Saved checkpoint: {latest_ckpt}")
+                # log(f"Saved checkpoint: {latest_ckpt}")
 
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
 
         resume_batch_step = 0
-        epoch_end_state = {"global_step": global_step, "epoch_step": 0}
-        epoch_ckpt = os.path.join(args.save_dir, f"{args.save_name}_epoch{epoch + 1}.pth")
-        save_checkpoint(
-            latest_ckpt,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch + 1,
-            step=epoch_end_state,
-            args=args,
-            best_loss=best_loss,
-        )
-        save_checkpoint(
-            epoch_ckpt,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch + 1,
-            step=epoch_end_state,
-            args=args,
-            best_loss=best_loss,
-        )
-        log(f"Finished epoch {epoch + 1}/{args.epochs}; saved {epoch_ckpt}")
-
+        log(f"Finished epoch {epoch + 1}/{args.epochs}")
+    save_model_only(out_path, model=model)
     log("Training complete.")
 
 

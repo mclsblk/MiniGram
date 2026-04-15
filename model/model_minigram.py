@@ -11,18 +11,18 @@ class MiniGramConfig(PretrainedConfig):
         self,
         dropout: int = 0.1,
         vocab_size: int = 10240,
-        num_attention_heads: int = 12,
-        num_kv_heads: int = 12,
+        num_attention_heads: int = 8,
+        num_kv_heads: int = 2,
         num_hidden_layers: int = 12,
         hidden_size: int = 768,
         intermediate_size: int = None,
         hidden_act: str = "gelu",
         initializer_range: int = 0.02,
         use_cache: bool = True,
-        max_length: int = 512,
+        max_length: int = 32768,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
-        flash_attention: bool = False,
+        flash_attention: bool = True if torch.cuda.is_available() else False,
         rope_scaling_params: dict = None,
         rope_theta: float = 100000.0,
         ##############################################
@@ -41,11 +41,12 @@ class MiniGramConfig(PretrainedConfig):
         ###########################################################
         use_engrams: bool = False,
         engram_vocab_size: int = 1024,
-        engram_ratio: float = 0.25,
-        engram_n_layer_list: list = [2],    # 在第几层使用engrams
+        engram_ratio: float = 1.0,
+        engram_n_layer_list: list = [1],    # 在第几层使用engrams
         engram_n_gram_list: list = [2, 3],  # 使用2-gram和3-gram
         engram_num_heads: int = 4,          # 每个阶数使用的哈希头数
-        engram_conv_size: int = 3,              # 卷积核大小
+        engram_conv_size: int = 3,          # 卷积核大小
+        engram_hash_seed: int = 17,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -93,6 +94,7 @@ class MiniGramConfig(PretrainedConfig):
         self.engram_n_gram_list = engram_n_gram_list
         self.engram_num_heads = engram_num_heads
         self.engram_conv_size = engram_conv_size
+        self.engram_hash_seed = engram_hash_seed
 
 
 
@@ -163,6 +165,33 @@ def _build_attention_bias(attention_mask, q_len, kv_len, device, dtype, past_len
         return attn_bias + attention_mask.to(device=device, dtype=dtype)
 
     raise ValueError(f"Unsupported attention_mask shape: {tuple(attention_mask.shape)}")
+
+
+def _get_attn_cache(past_key_value):
+    if past_key_value is None:
+        return None
+    if isinstance(past_key_value, dict):
+        return past_key_value.get("attn")
+    return past_key_value
+
+
+def _get_engram_tail(past_key_value):
+    if isinstance(past_key_value, dict):
+        return past_key_value.get("engram_tail")
+    return None
+
+
+def _get_engram_conv_state(past_key_value):
+    if isinstance(past_key_value, dict):
+        return past_key_value.get("engram_conv")
+    return None
+
+
+def _get_past_length(past_key_value):
+    attn_cache = _get_attn_cache(past_key_value)
+    if attn_cache is None:
+        return 0
+    return int(attn_cache[0].shape[1])
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -260,107 +289,147 @@ class SimpleAttention(nn.Module):
 
 
 class EngramModule(nn.Module):
-    def __init__(self, config: MiniGramConfig):
+    def __init__(self, config: MiniGramConfig, layer_id: int):
         super().__init__()
-        # 1. 核心超参数
-        self.n_gram_list = config.engram_n_gram_list      # e.g., [2, 3]
-        self.num_heads = config.engram_num_heads          # K = 8
-        self.engram_vocab_size = config.engram_vocab_size # 嵌入表槽数，建议设为质数
-        self.hidden_size = config.hidden_size             # d_model = 768
-        
-        # 2. 嵌入表 (Engram Memory)
-        # 为每个 (N-gram阶数, 哈希头) 组合创建一个独立的嵌入表
-        self.embeddings = nn.ModuleDict()
-        for n in self.n_gram_list:
-            for k in range(self.num_heads):
-                # 表名如 "emb_2_0", "emb_2_1"...
-                self.embeddings[f"emb_{n}_{k}"] = nn.Embedding(
-                    self.engram_vocab_size, self.hidden_size
-                )
-        self.down_proj = nn.Linear(
-            self.hidden_size * self.num_heads * len(self.n_gram_list), 
-            self.hidden_size
+        self.layer_id = layer_id
+        self.n_gram_list = config.engram_n_gram_list
+        self.num_heads = config.engram_num_heads
+        self.engram_vocab_size = config.engram_vocab_size
+        self.hidden_size = config.hidden_size
+        self.hash_seed = config.engram_hash_seed
+        self.conv_kernel_size = config.engram_conv_size
+        self.total_memory_heads = len(self.n_gram_list) * self.num_heads
+        target_memory_dim = max(
+            self.total_memory_heads,
+            int(round(self.hidden_size * max(float(config.engram_ratio), 1e-3))),
         )
-        
-        # 3. [门控机制] 动态决定记忆的融合程度
-        # 线性层将 hidden_size 映射到 1，用于计算门控标量 alpha_t
-        self.gate_proj = nn.Linear(self.hidden_size * 2, 1)
-        
-        # 4. [后处理卷积] 微调记忆向量（可选）
-        self.conv = nn.Conv1d(
+        self.head_dim = max(1, math.ceil(target_memory_dim / self.total_memory_heads))
+        self.memory_dim = self.head_dim * self.total_memory_heads
+        self.hash_modulus = self.engram_vocab_size - 1
+        self.token_tail_size = max(self.n_gram_list) - 1
+        self.conv_tail_size = self.conv_kernel_size - 1
+
+        self.head_slices = {}
+        head_offset = 0
+        for n in self.n_gram_list:
+            self.head_slices[n] = slice(head_offset, head_offset + self.num_heads)
+            head_offset += self.num_heads
+
+        self.hash_multiplier_names = {}
+        self.hash_offset_names = {}
+        for n in self.n_gram_list:
+            multipliers, offsets = self._build_hash_parameters(n)
+            multiplier_name = f"hash_multipliers_{n}"
+            offset_name = f"hash_offsets_{n}"
+            self.register_buffer(multiplier_name, multipliers, persistent=False)
+            self.register_buffer(offset_name, offsets, persistent=False)
+            self.hash_multiplier_names[n] = multiplier_name
+            self.hash_offset_names[n] = offset_name
+
+        self.embeddings = nn.ModuleList(
+            [nn.Embedding(self.engram_vocab_size, self.head_dim, padding_idx=0) for _ in range(self.total_memory_heads)]
+        )
+        self.memory_key_proj = nn.Linear(self.memory_dim, self.hidden_size, bias=False)
+        self.memory_value_proj = nn.Linear(self.memory_dim, self.hidden_size, bias=False)
+        self.memory_key_norm = RMSNorm(self.hidden_size)
+        self.memory_value_norm = RMSNorm(self.hidden_size)
+        self.memory_conv = nn.Conv1d(
             in_channels=self.hidden_size,
             out_channels=self.hidden_size,
-            kernel_size=4,
-            groups=self.hidden_size,   # 深度卷积
-            bias=False
+            kernel_size=self.conv_kernel_size,
+            groups=self.hidden_size,
+            bias=False,
         )
-        
-        # 5. [输出投影] 将融合后的结果映射回 hidden_size（如果需要）
-        # 如果直接相加，可能不需要此层；这里作为一个占位符
-        # self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
-    
-    def compute_n_gram_ids(self, input_ids, n, k):
-        """
-        Returns:
-            n_gram_ids: (batch, seq_len)
-            Right-aligned n-gram hash ids, with the first n-1 positions set to 0.
-        """
+
+    def _build_hash_parameters(self, n: int):
+        multipliers = []
+        offsets = []
+        max_int = (1 << 31) - 1
+        for head_idx in range(self.num_heads):
+            base_seed = (
+                self.hash_seed
+                + 10007 * (self.layer_id + 1)
+                + 1543 * (n + 1)
+                + 8191 * (head_idx + 1)
+            )
+            head_multipliers = []
+            for pos in range(n):
+                value = (base_seed + 32771 * (pos + 1) + 65537 * (head_idx + 1) * (pos + 1)) % max_int
+                head_multipliers.append(value * 2 + 1)
+            offset = (base_seed * 2147483647 + 97 * (n + head_idx + 1)) % max_int
+            multipliers.append(head_multipliers)
+            offsets.append(offset)
+        return torch.tensor(multipliers, dtype=torch.long), torch.tensor(offsets, dtype=torch.long)
+
+    def compute_hash_ids(self, input_ids, tail_tokens=None):
         batch_size, seq_len = input_ids.shape
-        device = input_ids.device
+        if tail_tokens is None:
+            tail_tokens = input_ids.new_zeros(batch_size, 0)
+        else:
+            tail_tokens = tail_tokens.to(device=input_ids.device, dtype=input_ids.dtype)
 
         if seq_len == 0:
-            return input_ids.new_zeros(batch_size, 0)
+            empty_hashes = input_ids.new_zeros(batch_size, 0, self.total_memory_heads)
+            new_tail = tail_tokens[:, -self.token_tail_size:] if self.token_tail_size > 0 else input_ids.new_zeros(batch_size, 0)
+            return empty_hashes, new_tail
 
-        # Per-head mixing coefficients.
-        head_bases = [31, 37, 41, 43, 47, 53, 59, 61]
-        base = head_bases[k % len(head_bases)]
+        context = torch.cat([tail_tokens, input_ids], dim=1)
+        prefix_len = tail_tokens.size(1)
+        hash_ids = input_ids.new_zeros(batch_size, seq_len, self.total_memory_heads)
 
-        if seq_len < n:
-            return input_ids.new_zeros(batch_size, seq_len)
+        if self.hash_modulus <= 0:
+            new_tail = context[:, -self.token_tail_size:] if self.token_tail_size > 0 else input_ids.new_zeros(batch_size, 0)
+            return hash_ids, new_tail
 
-        windows = input_ids.unfold(dimension=1, size=n, step=1)  # (batch, seq_len - n + 1, n)
-
-        # Small integer weights to avoid overflow/precision problems.
-        weights = input_ids.new_tensor([base + i for i in range(n)])  # (n,)
-        hash_vals = (windows * weights).sum(dim=-1) % (self.engram_vocab_size - 1)
-        hash_vals = hash_vals + 1  # reserve 0 as the empty / padded slot
-
-        n_gram_ids = input_ids.new_zeros(batch_size, seq_len)
-        n_gram_ids[:, n - 1:] = hash_vals
-        return n_gram_ids
-
-    def forward(self, hidden_states, input_ids):
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # 1. 收集所有头、所有阶数的记忆向量，并左填充到 token 维度对齐
-        mem_list = []
         for n in self.n_gram_list:
-            for k in range(self.num_heads):
-                n_gram_ids = self.compute_n_gram_ids(input_ids, n, k)   # (batch, seq_len)
-                emb = self.embeddings[f"emb_{n}_{k}"](n_gram_ids)       # (batch, seq_len, hidden)
-                mem_list.append(emb)
+            full_hash = input_ids.new_zeros(batch_size, context.size(1), self.num_heads)
+            if context.size(1) >= n:
+                windows = context.unfold(dimension=1, size=n, step=1).to(torch.long)
+                multipliers = getattr(self, self.hash_multiplier_names[n]).to(device=input_ids.device)
+                offsets = getattr(self, self.hash_offset_names[n]).to(device=input_ids.device)
+                mix = windows[:, :, 0].unsqueeze(-1) * multipliers[:, 0].view(1, 1, -1)
+                for pos in range(1, n):
+                    current = windows[:, :, pos].unsqueeze(-1) * multipliers[:, pos].view(1, 1, -1)
+                    mix = torch.bitwise_xor(mix, current)
+                full_hash[:, n - 1:, :] = torch.remainder(mix + offsets.view(1, 1, -1), self.hash_modulus) + 1
+            hash_ids[:, :, self.head_slices[n]] = full_hash[:, prefix_len:prefix_len + seq_len, :]
 
+        if self.token_tail_size > 0:
+            new_tail = context[:, -self.token_tail_size:]
+        else:
+            new_tail = input_ids.new_zeros(batch_size, 0)
+        return hash_ids, new_tail
 
-        # 2. 拼接并降维到 hidden_size
-        concat_mem = torch.cat(mem_list, dim=-1)                        # (batch, seq, hidden * num_heads * len)
-        memory_vec = self.down_proj(concat_mem)
+    def retrieve_memory(self, hash_ids):
+        head_embeddings = [embedding(hash_ids[:, :, head_idx]) for head_idx, embedding in enumerate(self.embeddings)]
+        return torch.cat(head_embeddings, dim=-1)
 
-        # 3. 计算门控标量（同时依赖 hidden_states 和 memory_vec）
-        gate_input = torch.cat([hidden_states, memory_vec], dim=-1)     # (batch, seq, hidden*2)
-        alpha = torch.sigmoid(self.gate_proj(gate_input))               # (batch, seq, 1)
+    def apply_memory_conv(self, memory_value, conv_state=None):
+        batch_size, seq_len, _ = memory_value.shape
+        if conv_state is None:
+            conv_state = memory_value.new_zeros(batch_size, 0, self.hidden_size)
+        else:
+            conv_state = conv_state.to(device=memory_value.device, dtype=memory_value.dtype)
 
-        # 4. 残差融合
-        fused = hidden_states + alpha * memory_vec                      # (batch, seq, hidden)
+        conv_source = torch.cat([conv_state, memory_value], dim=1)
+        conv_full = self.memory_conv(F.pad(conv_source.transpose(1, 2), (self.conv_tail_size, 0))).transpose(1, 2)
+        conv_current = conv_full[:, -seq_len:, :]
+        if self.conv_tail_size > 0:
+            new_conv_state = conv_source[:, -self.conv_tail_size:, :]
+        else:
+            new_conv_state = memory_value.new_zeros(batch_size, 0, self.hidden_size)
+        return conv_current, new_conv_state
 
-        # 5. 因果卷积微调（保持因果性）
-        fused = fused.transpose(1, 2)                                   # (batch, hidden, seq)
-        fused_pad = F.pad(fused, (3, 0))                               # 因果填充，假设 kernel_size=4
-        out = self.conv(fused_pad).transpose(1, 2)                     # (batch, seq, hidden)
-
-        # 6. 输出投影（如果需要）
-        # out = self.out_proj(out)
-
-        return out    
+    def forward(self, hidden_states, input_ids, tail_tokens=None, conv_state=None):
+        hash_ids, new_tail = self.compute_hash_ids(input_ids, tail_tokens=tail_tokens)
+        memory = self.retrieve_memory(hash_ids)
+        memory_key = self.memory_key_norm(self.memory_key_proj(memory))
+        memory_value = self.memory_value_norm(self.memory_value_proj(memory))
+        gate_logits = (hidden_states * memory_key).sum(dim=-1) / math.sqrt(self.hidden_size)
+        gate = torch.sigmoid(gate_logits).unsqueeze(-1)
+        gated_memory = gate * memory_value
+        conv_out, new_conv_state = self.apply_memory_conv(gated_memory, conv_state=conv_state)
+        return gated_memory + conv_out, new_tail, new_conv_state
 
 
 class FFN(nn.Module):
@@ -396,21 +465,23 @@ class TransformerBlock(nn.Module):
             self.norm1(hidden_states),
             attention_mask,
             use_cache,
-            past_key_value,
+            _get_attn_cache(past_key_value),
             precompute_freqs,
         )
         hidden_states = residual + attn_output
         residual = hidden_states
         ffn_output = self.ffn(self.norm2(hidden_states))
         hidden_states = residual + ffn_output
-        return hidden_states, new_past_key_value
+        layer_cache = {"attn": new_past_key_value} if use_cache else None
+        return hidden_states, layer_cache
     
 
 class TransformerBlockWithEngram(nn.Module):
-    def __init__(self, config: MiniGramConfig):
+    def __init__(self, config: MiniGramConfig, layer_id: int):
         super().__init__()
+        self.layer_id = layer_id
         self.attention = SimpleAttention(config)
-        self.engram = EngramModule(config)
+        self.engram = EngramModule(config, layer_id=layer_id)
         self.ffn = FFN(config)
         self.norm1 = RMSNorm(config.hidden_size)
         self.norm2 = RMSNorm(config.hidden_size)
@@ -422,20 +493,30 @@ class TransformerBlockWithEngram(nn.Module):
             self.norm1(hidden_states),
             attention_mask,
             use_cache,
-            past_key_value,
+            _get_attn_cache(past_key_value),
             precompute_freqs
         )
         hidden_states = residual + attn_output
 
-        # Engram模块融合
-        engram_output = self.engram(self.norm2(hidden_states), input_ids)
+        engram_output, new_engram_tail, new_engram_conv = self.engram(
+            self.norm2(hidden_states),
+            input_ids,
+            tail_tokens=_get_engram_tail(past_key_value),
+            conv_state=_get_engram_conv_state(past_key_value),
+        )
         hidden_states = hidden_states + engram_output
-
 
         residual = hidden_states
         ffn_output = self.ffn(self.norm3(hidden_states))
         hidden_states = residual + ffn_output
-        return hidden_states, new_past_key_value
+        layer_cache = None
+        if use_cache:
+            layer_cache = {
+                "attn": new_past_key_value,
+                "engram_tail": new_engram_tail,
+                "engram_conv": new_engram_conv,
+            }
+        return hidden_states, layer_cache
 
 
 class MiniGramModel(nn.Module):
@@ -446,7 +527,7 @@ class MiniGramModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
             if config.use_engrams and i in config.engram_n_layer_list:
-                self.layers.append(TransformerBlockWithEngram(config))
+                self.layers.append(TransformerBlockWithEngram(config, layer_id=i))
             else:
                 self.layers.append(TransformerBlock(config))
         self.norm = RMSNorm(config.hidden_size)
@@ -463,7 +544,10 @@ class MiniGramModel(nn.Module):
         hidden_states = self.token_embedding(input_ids)
         new_past_key_values = []
         seq_length = input_ids.size(1)
-        past_length = past_key_values[0][0].size(1) if past_key_values is not None else 0
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)
+        past_length = _get_past_length(past_key_values[0]) if past_key_values else 0
         precompute_freqs = (
             self.precompute_freqs_cos[past_length:past_length + seq_length],
             self.precompute_freqs_sin[past_length:past_length + seq_length],
@@ -533,3 +617,41 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         )
         setattr(output, "aux_loss", logits.new_zeros(()))
         return output
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+        }
+
+    def _reorder_cache(self, past_key_values, beam_idx):
+        if past_key_values is None:
+            return past_key_values
+
+        reordered = []
+        for layer_cache in past_key_values:
+            if layer_cache is None:
+                reordered.append(None)
+                continue
+
+            if isinstance(layer_cache, dict):
+                reordered_layer_cache = {}
+                for key, value in layer_cache.items():
+                    if value is None:
+                        reordered_layer_cache[key] = None
+                    elif isinstance(value, tuple):
+                        reordered_layer_cache[key] = tuple(
+                            tensor.index_select(0, beam_idx.to(tensor.device)) for tensor in value
+                        )
+                    else:
+                        reordered_layer_cache[key] = value.index_select(0, beam_idx.to(value.device))
+                reordered.append(reordered_layer_cache)
+            else:
+                reordered.append(
+                    tuple(tensor.index_select(0, beam_idx.to(tensor.device)) for tensor in layer_cache)
+                )
+        return reordered

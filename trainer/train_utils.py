@@ -6,6 +6,8 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from transformers import AutoTokenizer
+from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -19,7 +21,6 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.benchmark = False
     else:
         torch.backends.cudnn.benchmark = True
-
 
 def get_lr(step, total_steps, base_lr, warmup_steps, min_lr) -> float:
     if total_steps <= 0:
@@ -105,6 +106,15 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, step, args, best_loss
         "args": vars(args) if hasattr(args, "__dict__") else args,
         "best_loss": best_loss,
     }
+    torch.save(payload, path)
+
+
+def save_model_only(path, model, dtype=torch.float16):
+    save_dir = os.path.dirname(path) or "."
+    os.makedirs(save_dir, exist_ok=True)
+    raw_model = _unwrap_model(model)
+    state_dict = raw_model.state_dict()
+    payload = {k: v.detach().to(dtype=dtype).cpu() for k, v in state_dict.items()}
     torch.save(payload, path)
 
 
