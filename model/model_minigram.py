@@ -1,6 +1,5 @@
 from transformers import PretrainedConfig
 from typing import Optional
-
 import torch
 import math
 
@@ -25,20 +24,20 @@ class MiniGramConfig(PretrainedConfig):
         flash_attention: bool = True if torch.cuda.is_available() else False,
         rope_scaling_params: dict = None,
         rope_theta: float = 100000.0,
-        ##############################################
+        # ############################################
         # MoE-specific parameters
         # When use_moe is False, the following parameters will be ignored
-        ###############################################
+        # #############################################
         use_moe: bool = False,
         num_experts: int = 4,
         shard_expert: bool = False,
         num_expert_per_token: int = 2,
         scoring_func: str = "softmax",
         aux_loss_coef: float = 0.01,
-        ###########################################################
+        # #########################################################
         # engram-specific parameters
         # When use_engrams is False, the following parameters will be ignored
-        ###########################################################
+        # #########################################################
         use_engrams: bool = False,
         engram_vocab_size: int = 1024,
         engram_ratio: float = 1.0,
@@ -50,43 +49,35 @@ class MiniGramConfig(PretrainedConfig):
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.dropout = dropout                      # The dropout probability for all fully connected layers in the embeddings, text_encoder, and pooler.
-        self.vocab_size = vocab_size                    # The size of the vocabulary, including special tokens.
-        self.max_length = max_length                    # The maximum sequence length that the model can process. Sequences longer than this will be truncated.
-        self.num_attention_heads = num_attention_heads  # The number of attention heads in each attention layer. This should be a divisor of hidden_size.
-        self.num_kv_heads = num_kv_heads                # The number of key-value heads in each attention layer. This should be a divisor of num_attention_heads.
+        self.dropout = dropout                          
+        self.vocab_size = vocab_size                    
+        self.max_length = max_length                    
+        self.num_attention_heads = num_attention_heads  
+        self.num_kv_heads = num_kv_heads                
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
-        self.initializer_range = initializer_range      # The standard deviation of the truncated_normal_initializer for initializing all weight matrices. This is used to control the scale of the initial weights, which can affect the convergence of the model during training.
-        self.use_cache = use_cache                      # Whether the model should return the key-value states on each forward pass. This is used to speed up decoding by reusing previously computed key-value states.
+        self.initializer_range = initializer_range      
+        self.use_cache = use_cache                     
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.flash_attention = flash_attention
-        self.rope_theta = rope_theta                    # The base period of the RoPE. This is used to control the frequency of the sinusoidal functions in the RoPE. A larger theta allows the model to capture longer-range dependencies, while a smaller theta focuses more on local interactions.
+        self.rope_theta = rope_theta                    
         self.rope_factors = {
-            "beta_fast": 16.0,   # The scaling factor for the fast attention heads in the RoPE. This is used to control the relative importance of the fast attention heads compared to the slow attention heads in the RoPE. A larger beta_fast gives more weight to the fast attention heads.
+            "beta_fast": 16.0,
             "beta_slow": 1.0,
-            "factor": 16,       # The scaling factor for the RoPE. This is used to control the overall scale of the RoPE. A larger factor allows the model to capture longer-range dependencies, while a smaller factor focuses more on local interactions.
+            "factor": 16,
             "original_max_position_embeddings": 2048,
             "attention_factor": 1.0,
             "type": "yarn"
         } if rope_scaling_params is None else rope_scaling_params
-        ###############################
-        # MoE-specific parameters
-        # When use_moe is False, the following parameters will be ignored
-        ###############################
         self.use_moe = use_moe
         self.num_experts = num_experts
         self.shard_expert = shard_expert
         self.num_expert_per_token = num_expert_per_token
         self.scoring_func = scoring_func
         self.aux_loss_coef = aux_loss_coef
-        ###########################################################
-        # engram-specific parameters
-        # When use_engrams is False, the following parameters will be ignored
-        ###########################################################
         self.use_engrams = use_engrams
         self.engram_vocab_size = engram_vocab_size
         self.engram_ratio = engram_ratio
@@ -95,8 +86,6 @@ class MiniGramConfig(PretrainedConfig):
         self.engram_num_heads = engram_num_heads
         self.engram_conv_size = engram_conv_size
         self.engram_hash_seed = engram_hash_seed
-
-
 
 
 from transformers.activations import ACT2FN
@@ -122,16 +111,16 @@ def _precompute_freqs_cis(dim, end, theta=100000.0, params:Optional[dict]=None):
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs) * attn_factor
-    freq_cos = torch.cat((freqs_cis.real.float(), freqs_cis.real.float()), dim=-1)
-    freq_sin = torch.cat((freqs_cis.imag.float(), freqs_cis.imag.float()), dim=-1)
+    freq_cos = freqs_cis.real.float().repeat_interleave(2, dim=-1)
+    freq_sin = freqs_cis.imag.float().repeat_interleave(2, dim=-1)
     return freqs_cis, freq_cos, freq_sin
 
 def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # q,k: (batch, seq, head, dim), cos,sin: (seq, dim)
-    cos = cos.unsqueeze(unsqueeze_dim)  # (seq, 1, dim)
-    sin = sin.unsqueeze(unsqueeze_dim)  # (seq, 1, dim)
-    q_embed = torch.stack([-q[..., 1::2], q[..., ::2]], -1).reshape_as(q)  # (batch, seq, head, dim)
-    k_embed = torch.stack([-k[..., 1::2], k[..., ::2]], -1).reshape_as(k)  # (batch, seq, head, dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = torch.stack([-q[..., 1::2], q[..., ::2]], -1).reshape_as(q)
+    k_embed = torch.stack([-k[..., 1::2], k[..., ::2]], -1).reshape_as(k)
     q_out = q * cos + q_embed * sin
     k_out = k * cos + k_embed * sin
     return q_out, k_out
@@ -144,54 +133,40 @@ def repeat_kv(tensor, num_kv_heads, num_attention_heads):
     repeat_factor = num_attention_heads // num_kv_heads
     return tensor.unsqueeze(3).repeat_interleave(repeat_factor, dim=3).reshape(b, s, num_attention_heads, d)
 
-def _build_attention_bias(attention_mask, q_len, kv_len, device, dtype, past_length=0):
-    causal = torch.triu(
-        torch.ones(q_len, kv_len, device=device, dtype=torch.bool),
-        diagonal=1 + past_length,
-    )
-    attn_bias = torch.zeros((1, 1, q_len, kv_len), device=device, dtype=dtype)
-    min_value = torch.finfo(dtype).min
-    attn_bias = attn_bias.masked_fill(causal.unsqueeze(0).unsqueeze(0), min_value)
-
-    if attention_mask is None:
-        return attn_bias
-
-    if attention_mask.dim() == 2:
-        key_mask = attention_mask[:, :kv_len].to(device=device)
-        key_mask = key_mask[:, None, None, :].to(torch.bool)
-        return attn_bias.masked_fill(~key_mask, min_value)
-
-    if attention_mask.dim() == 4:
-        return attn_bias + attention_mask.to(device=device, dtype=dtype)
-
-    raise ValueError(f"Unsupported attention_mask shape: {tuple(attention_mask.shape)}")
-
-
-def _get_attn_cache(past_key_value):
+def _get_from_cache(past_key_value, key):
     if past_key_value is None:
         return None
     if isinstance(past_key_value, dict):
-        return past_key_value.get("attn")
-    return past_key_value
-
-
-def _get_engram_tail(past_key_value):
-    if isinstance(past_key_value, dict):
-        return past_key_value.get("engram_tail")
+        return past_key_value.get(key)
     return None
-
-
-def _get_engram_conv_state(past_key_value):
-    if isinstance(past_key_value, dict):
-        return past_key_value.get("engram_conv")
-    return None
-
 
 def _get_past_length(past_key_value):
-    attn_cache = _get_attn_cache(past_key_value)
-    if attn_cache is None:
+    if past_key_value is None:
         return 0
-    return int(attn_cache[0].shape[1])
+    if isinstance(past_key_value, dict) and "attn" in past_key_value:
+        attn_cache = past_key_value["attn"]
+        if attn_cache is not None and isinstance(attn_cache, tuple) and len(attn_cache) == 2:
+            k_cache = attn_cache[0]
+            if k_cache is not None and k_cache.dim() >= 2:
+                return k_cache.size(1)
+    return 0
+
+def _normalize_past_key_values(past_key_values):
+    if past_key_values is None:
+        return None
+
+    to_legacy = getattr(past_key_values, "to_legacy_cache", None)
+    if callable(to_legacy):
+        legacy_cache = to_legacy()
+        if legacy_cache is not None:
+            return legacy_cache
+
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None:
+        return layers
+
+    return past_key_values
+
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -213,33 +188,24 @@ class SimpleAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_kv_heads = config.num_kv_heads
         self.num_attention_heads = config.num_attention_heads
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.k_proj = nn.Linear(config.hidden_size, self.head_dim * self.num_kv_heads)
-        self.v_proj = nn.Linear(config.hidden_size, self.head_dim * self.num_kv_heads)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.head_dim * self.num_kv_heads, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.head_dim * self.num_kv_heads, bias=False)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.dropout_rate = config.dropout
         self.dropout = nn.Dropout(config.dropout)
         self.rope_theta = config.rope_theta
         self.rope_factors = config.rope_factors
         self.flash_attn = config.flash_attention
     
-    def forward(
-            self, 
-            hidden_states, 
-            attention_mask=None, 
-            use_cache=False, 
-            past_key_value=None,
-            precompute_freqs=None
-        ):
+    def forward(self, hidden_states, precompute_freqs, 
+                attention_mask=None, use_cache=False, past_key_value=None):
         batch_size, seq_length, _ = hidden_states.size()
         q = self.q_proj(hidden_states).view(batch_size, seq_length, self.num_attention_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
 
-        if precompute_freqs is not None:
-            cos, sin = precompute_freqs
-        else:
-            _, cos, sin = _precompute_freqs_cis(self.head_dim, seq_length, theta=self.rope_theta, params=self.rope_factors)
+        cos, sin = precompute_freqs
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
         if use_cache:
@@ -254,15 +220,11 @@ class SimpleAttention(nn.Module):
             k = repeat_kv(k, self.num_kv_heads, self.num_attention_heads)
             v = repeat_kv(v, self.num_kv_heads, self.num_attention_heads)
 
-
         if self.flash_attn and (seq_length > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
             attn_output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 is_causal=True,
             )
@@ -271,14 +233,23 @@ class SimpleAttention(nn.Module):
             kv_length = k.size(1)
             past_length = kv_length - seq_length
             attn_weights = torch.einsum("bqhd,bkhd->bhqk", q, k) / math.sqrt(self.head_dim)
-            attn_bias = _build_attention_bias(
-                attention_mask,
-                q_len=seq_length,
-                kv_len=kv_length,
-                device=hidden_states.device,
-                dtype=attn_weights.dtype,
-                past_length=past_length,
+            min_value = -1e9 if attn_weights.dtype == torch.float32 else -1e4
+            causal_mask = torch.triu(
+                torch.ones(seq_length, kv_length, device=hidden_states.device, dtype=torch.bool),
+                diagonal=1 + past_length,
             )
+            attn_bias = torch.zeros((1, 1, seq_length, kv_length), device=hidden_states.device, dtype=attn_weights.dtype)
+            attn_bias = attn_bias.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), min_value)
+
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    key_mask = attention_mask[:, :kv_length].to(device=hidden_states.device, dtype=torch.bool)
+                    attn_bias = attn_bias.masked_fill(~key_mask[:, None, None, :], min_value)
+                elif attention_mask.dim() == 4:
+                    attn_bias = attn_bias + attention_mask.to(device=hidden_states.device, dtype=attn_weights.dtype)
+                else:
+                    raise ValueError(f"Unsupported attention_mask shape: {tuple(attention_mask.shape)}")
+
             attn_weights = attn_weights + attn_bias
             attn_probs = torch.softmax(attn_weights, dim=-1)
             attn_probs = self.dropout(attn_probs)
@@ -340,6 +311,8 @@ class EngramModule(nn.Module):
             groups=self.hidden_size,
             bias=False,
         )
+        self.memory_gate_bias = nn.Parameter(torch.tensor(-4.0))
+        nn.init.zeros_(self.memory_conv.weight)
 
     def _build_hash_parameters(self, n: int):
         multipliers = []
@@ -356,7 +329,7 @@ class EngramModule(nn.Module):
             for pos in range(n):
                 value = (base_seed + 32771 * (pos + 1) + 65537 * (head_idx + 1) * (pos + 1)) % max_int
                 head_multipliers.append(value * 2 + 1)
-            offset = (base_seed * 2147483647 + 97 * (n + head_idx + 1)) % max_int
+            offset = (base_seed * 48271 + 97 * (n + head_idx + 1)) % max_int
             multipliers.append(head_multipliers)
             offsets.append(offset)
         return torch.tensor(multipliers, dtype=torch.long), torch.tensor(offsets, dtype=torch.long)
@@ -426,17 +399,16 @@ class EngramModule(nn.Module):
         memory_key = self.memory_key_norm(self.memory_key_proj(memory))
         memory_value = self.memory_value_norm(self.memory_value_proj(memory))
         gate_logits = (hidden_states * memory_key).sum(dim=-1) / math.sqrt(self.hidden_size)
+        gate_logits = gate_logits + self.memory_gate_bias
         gate = torch.sigmoid(gate_logits).unsqueeze(-1)
         gated_memory = gate * memory_value
         conv_out, new_conv_state = self.apply_memory_conv(gated_memory, conv_state=conv_state)
         return gated_memory + conv_out, new_tail, new_conv_state
 
-
-class FFN(nn.Module):
-    """
-    same impl as minimind FeedForward
-    """
-    
+# ############################################################################ #
+# FFN and FFNofMoE are same implementation from minimind                       #
+# ############################################################################ #
+class FFN(nn.Module): 
     def __init__(self, config: MiniGramConfig):
         super().__init__()
         if config.intermediate_size is None:
@@ -451,71 +423,80 @@ class FFN(nn.Module):
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
-class TransformerBlock(nn.Module):
+class FFNofMoE(nn.Module):
     def __init__(self, config: MiniGramConfig):
         super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [FFN(config) for _ in range(config.num_experts)]
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.loss_coef = config.aux_loss_coef
+        
+    def forward(self, x: torch.Tensor):
+        batch_size, seq_length, hidden_size = x.size()
+        x_flat = x.view(-1, hidden_size)
+        gate_probs = F.softmax(self.gate(x_flat), dim=-1)
+        topk_probs, topk_indices = torch.topk(gate_probs, self.config.num_expert_per_token, dim=-1)
+        expert_outputs = torch.zeros_like(x_flat)
+        for indices, expert in enumerate(self.experts):
+            mask = (topk_indices == indices).any(dim=-1)
+            if mask.any():
+                weight = topk_probs[mask].view(-1, 1)
+                expert_output = expert(x_flat[mask]).view(-1, 1) * weight
+                expert_outputs.index_add_(0, mask.any(dim=-1).nonzero().flatten(), expert_output)
+            elif self.training:
+                expert_outputs = expert_outputs + 0.0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.loss_coef > 0:
+            load = F.one_hot(topk_indices, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * gate_probs.mean(0)).sum() * self.config.num_experts * self.loss_coef
+        else:
+            self.aux_loss = torch.tensor(0.0, device=x.device)
+        return expert_outputs.view(batch_size, seq_length, hidden_size)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: MiniGramConfig, layer_id: int = None):
+        super().__init__()
         self.attention = SimpleAttention(config)
-        self.ffn = FFN(config)
+        self.ffn = FFN(config) if not config.use_moe else FFNofMoE(config)   
         self.norm1 = RMSNorm(config.hidden_size)
         self.norm2 = RMSNorm(config.hidden_size)
+        if config.use_engrams and (layer_id is not None) and (layer_id in config.engram_n_layer_list):
+            self.layer_id = layer_id
+            self.engram = EngramModule(config, layer_id=layer_id)
+            self.norm_engram = RMSNorm(config.hidden_size)
+        else:
+            self.engram = None
     
-    def forward(self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, precompute_freqs=None):
+    def forward(self, hidden_states, attention_mask=None, use_cache=False, 
+                past_key_value=None, precompute_freqs=None, input_ids=None):
         residual = hidden_states
         attn_output, new_past_key_value = self.attention(
             self.norm1(hidden_states),
+            precompute_freqs,
             attention_mask,
             use_cache,
-            _get_attn_cache(past_key_value),
-            precompute_freqs,
+            _get_from_cache(past_key_value, "attn"),
         )
         hidden_states = residual + attn_output
+        layer_cache = {"attn": new_past_key_value} if use_cache else None
+        
+        if self.engram is not None:
+            engram_output, new_engram_tail, new_engram_conv = self.engram(
+            self.norm_engram(hidden_states),
+            input_ids,
+            tail_tokens=_get_from_cache(past_key_value, "engram_tail"),
+            conv_state=_get_from_cache(past_key_value, "engram_conv")
+            )
+            hidden_states = hidden_states + engram_output
+            if use_cache:
+                layer_cache["engram_tail"] = new_engram_tail
+                layer_cache["engram_conv"] = new_engram_conv
+
         residual = hidden_states
         ffn_output = self.ffn(self.norm2(hidden_states))
         hidden_states = residual + ffn_output
-        layer_cache = {"attn": new_past_key_value} if use_cache else None
-        return hidden_states, layer_cache
-    
-
-class TransformerBlockWithEngram(nn.Module):
-    def __init__(self, config: MiniGramConfig, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.attention = SimpleAttention(config)
-        self.engram = EngramModule(config, layer_id=layer_id)
-        self.ffn = FFN(config)
-        self.norm1 = RMSNorm(config.hidden_size)
-        self.norm2 = RMSNorm(config.hidden_size)
-        self.norm3 = RMSNorm(config.hidden_size)
-
-    def forward(self, hidden_states, input_ids, precompute_freqs, attention_mask=None, use_cache=False, past_key_value=None):
-        residual = hidden_states
-        attn_output, new_past_key_value = self.attention(
-            self.norm1(hidden_states),
-            attention_mask,
-            use_cache,
-            _get_attn_cache(past_key_value),
-            precompute_freqs
-        )
-        hidden_states = residual + attn_output
-
-        engram_output, new_engram_tail, new_engram_conv = self.engram(
-            self.norm2(hidden_states),
-            input_ids,
-            tail_tokens=_get_engram_tail(past_key_value),
-            conv_state=_get_engram_conv_state(past_key_value),
-        )
-        hidden_states = hidden_states + engram_output
-
-        residual = hidden_states
-        ffn_output = self.ffn(self.norm3(hidden_states))
-        hidden_states = residual + ffn_output
-        layer_cache = None
-        if use_cache:
-            layer_cache = {
-                "attn": new_past_key_value,
-                "engram_tail": new_engram_tail,
-                "engram_conv": new_engram_conv,
-            }
         return hidden_states, layer_cache
 
 
@@ -526,10 +507,7 @@ class MiniGramModel(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
-            if config.use_engrams and i in config.engram_n_layer_list:
-                self.layers.append(TransformerBlockWithEngram(config, layer_id=i))
-            else:
-                self.layers.append(TransformerBlock(config))
+            self.layers.append(TransformerBlock(config, layer_id=i))
         self.norm = RMSNorm(config.hidden_size)
         _, cos, sin = _precompute_freqs_cis(
             config.hidden_size // config.num_attention_heads,
@@ -537,15 +515,14 @@ class MiniGramModel(nn.Module):
             theta=config.rope_theta, 
             params=config.rope_factors
         )
-        self.register_buffer("precompute_freqs_cos", cos)
-        self.register_buffer("precompute_freqs_sin", sin)
+        self.register_buffer("precompute_freqs_cos", cos, persistent=False)
+        self.register_buffer("precompute_freqs_sin", sin, persistent=False)
     
     def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None):
         hidden_states = self.token_embedding(input_ids)
         new_past_key_values = []
         seq_length = input_ids.size(1)
-        if hasattr(past_key_values, 'layers'):
-            past_key_values = None
+        past_key_values = _normalize_past_key_values(past_key_values)
         past_key_values = past_key_values or [None] * len(self.layers)
         past_length = _get_past_length(past_key_values[0]) if past_key_values else 0
         precompute_freqs = (
@@ -554,14 +531,14 @@ class MiniGramModel(nn.Module):
         )
         for i, layer in enumerate(self.layers):
             past_key_value = past_key_values[i] if past_key_values is not None else None
-            if isinstance(layer, TransformerBlockWithEngram):
-                hidden_states, new_past_key_value = layer(
-                    hidden_states, input_ids, precompute_freqs, attention_mask, use_cache, past_key_value
-                )
-            else:
-                hidden_states, new_past_key_value = layer(
-                    hidden_states, attention_mask, use_cache, past_key_value, precompute_freqs
-                )
+            hidden_states, new_past_key_value = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                past_key_value=past_key_value,
+                precompute_freqs=precompute_freqs,
+                input_ids=input_ids,
+            )
             new_past_key_values.append(new_past_key_value)
         hidden_states = self.norm(hidden_states)
         return hidden_states, new_past_key_values
@@ -578,16 +555,8 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         self.use_cache = config.use_cache
         self.post_init()
     
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        use_cache=None,
-        past_key_values=None,
-        labels=None,
-        logits_to_keep=0,
-        **kwargs
-    ):
+    def forward(self, input_ids=None, attention_mask=None, use_cache=None,
+                past_key_values=None, labels=None, logits_to_keep=0, **kwargs):
         use_cache = self.use_cache if use_cache is None else use_cache
 
         hidden_states, new_past_key_values = self.model(
@@ -618,15 +587,6 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         setattr(output, "aux_loss", logits.new_zeros(()))
         return output
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs):
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-        }
 
     def _reorder_cache(self, past_key_values, beam_idx):
         if past_key_values is None:
