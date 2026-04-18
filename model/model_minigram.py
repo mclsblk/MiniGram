@@ -11,11 +11,11 @@ class MiniGramConfig(PretrainedConfig):
         dropout: int = 0.1,
         vocab_size: int = 10240,
         num_attention_heads: int = 8,
-        num_kv_heads: int = 2,
+        num_kv_heads: int = 4,
         num_hidden_layers: int = 12,
         hidden_size: int = 768,
         intermediate_size: int = None,
-        hidden_act: str = "gelu",
+        hidden_act: str = "silu",
         initializer_range: int = 0.02,
         use_cache: bool = True,
         max_length: int = 32768,
@@ -30,9 +30,7 @@ class MiniGramConfig(PretrainedConfig):
         # #############################################
         use_moe: bool = False,
         num_experts: int = 4,
-        shard_expert: bool = False,
         num_expert_per_token: int = 2,
-        scoring_func: str = "softmax",
         aux_loss_coef: float = 0.01,
         # #########################################################
         # engram-specific parameters
@@ -40,7 +38,6 @@ class MiniGramConfig(PretrainedConfig):
         # #########################################################
         use_engrams: bool = False,
         engram_vocab_size: int = 1024,
-        engram_ratio: float = 1.0,
         engram_n_layer_list: list = [1],    # 在第几层使用engrams
         engram_n_gram_list: list = [2, 3],  # 使用2-gram和3-gram
         engram_num_heads: int = 4,          # 每个阶数使用的哈希头数
@@ -74,13 +71,10 @@ class MiniGramConfig(PretrainedConfig):
         } if rope_scaling_params is None else rope_scaling_params
         self.use_moe = use_moe
         self.num_experts = num_experts
-        self.shard_expert = shard_expert
         self.num_expert_per_token = num_expert_per_token
-        self.scoring_func = scoring_func
         self.aux_loss_coef = aux_loss_coef
         self.use_engrams = use_engrams
         self.engram_vocab_size = engram_vocab_size
-        self.engram_ratio = engram_ratio
         self.engram_n_layer_list = engram_n_layer_list
         self.engram_n_gram_list = engram_n_gram_list
         self.engram_num_heads = engram_num_heads
@@ -270,11 +264,7 @@ class EngramModule(nn.Module):
         self.hash_seed = config.engram_hash_seed
         self.conv_kernel_size = config.engram_conv_size
         self.total_memory_heads = len(self.n_gram_list) * self.num_heads
-        target_memory_dim = max(
-            self.total_memory_heads,
-            int(round(self.hidden_size * max(float(config.engram_ratio), 1e-3))),
-        )
-        self.head_dim = max(1, math.ceil(target_memory_dim / self.total_memory_heads))
+        self.head_dim = max(1, math.ceil(self.hidden_size / self.total_memory_heads))
         self.memory_dim = self.head_dim * self.total_memory_heads
         self.hash_modulus = self.engram_vocab_size - 1
         self.token_tail_size = max(self.n_gram_list) - 1

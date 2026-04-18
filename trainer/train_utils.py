@@ -103,7 +103,7 @@ def get_param(model):
     }
 
 
-def save_checkpoint(path, model, name, optimizer, epoch, step, model_dtype=torch.float16):
+def save_checkpoint(path, model, name, optimizer, step, model_dtype=torch.float16):
     save_dir = os.path.join(path, "checkpoint")
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{name}.pth")

@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=340, help="Sequence length")
 
     # model
-    parser.add_argument("--hidden_size", type=int, default=512)
+    parser.add_argument("--hidden_size", type=int, default=768)
     parser.add_argument("--num_hidden_layers", type=int, default=12)
     parser.add_argument("--use_moe", type=int, default=0, choices=[0, 1], help="Enable Mixture of Experts (MoE) layers")
     parser.add_argument("--use_engrams", type=int, default=0, choices=[0, 1], help="Enable engram blocks")
@@ -204,12 +204,12 @@ def main():
                 )
 
             if (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                save_model_only(args.save_dir, model=model, name=args.save_name, dtype=args.dtype)
+                save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model.dtype)
                 save_checkpoint(args.save_dir, model=model, name=args.save_name, optimizer=optimizer,
-                                step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=args.dtype)
+                                step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model.dtype)
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
         log(f"Epoch {epoch + 1} complete.")
-    save_model_only(args.save_dir, model=model)
+    save_model_only(args.save_dir, model=model,name=args.save_name)
     log("Training complete.")
 
 
