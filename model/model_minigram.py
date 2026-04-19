@@ -6,61 +6,42 @@ import math
 class MiniGramConfig(PretrainedConfig):
     model_type = "minigram"
 
-    def __init__(
-        self,
-        dropout: int = 0.1,
-        vocab_size: int = 10240,
-        num_attention_heads: int = 8,
-        num_kv_heads: int = 4,
-        num_hidden_layers: int = 12,
-        hidden_size: int = 768,
-        intermediate_size: int = None,
-        hidden_act: str = "silu",
-        initializer_range: int = 0.02,
-        use_cache: bool = True,
-        max_length: int = 32768,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
-        flash_attention: bool = True if torch.cuda.is_available() else False,
-        rope_scaling_params: dict = None,
-        rope_theta: float = 100000.0,
-        # ############################################
-        # MoE-specific parameters
-        # When use_moe is False, the following parameters will be ignored
-        # #############################################
-        use_moe: bool = False,
-        num_experts: int = 4,
-        num_expert_per_token: int = 2,
-        aux_loss_coef: float = 0.01,
-        # #########################################################
-        # engram-specific parameters
-        # When use_engrams is False, the following parameters will be ignored
-        # #########################################################
-        use_engrams: bool = False,
-        engram_vocab_size: int = 1024,
-        engram_n_layer_list: list = [1],    # 在第几层使用engrams
-        engram_n_gram_list: list = [2, 3],  # 使用2-gram和3-gram
-        engram_num_heads: int = 4,          # 每个阶数使用的哈希头数
-        engram_conv_size: int = 3,          # 卷积核大小
-        engram_hash_seed: int = 17,
-        **kwargs
-    ):
+    def __init__(self, hidden_size: int = 768, num_hidden_layers: int = 12, **kwargs):
         super().__init__(**kwargs)
-        self.dropout = dropout                          
-        self.vocab_size = vocab_size                    
-        self.max_length = max_length                    
-        self.num_attention_heads = num_attention_heads  
-        self.num_kv_heads = num_kv_heads                
-        self.num_hidden_layers = num_hidden_layers
+        
         self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range      
-        self.use_cache = use_cache                     
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.flash_attention = flash_attention
-        self.rope_theta = rope_theta                    
+        self.num_hidden_layers = num_hidden_layers
+        
+        self.dropout = kwargs.get("dropout", 0.1)
+        self.vocab_size = kwargs.get("vocab_size", 10240)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_kv_heads = kwargs.get("num_kv_heads", 4)
+        self.intermediate_size = kwargs.get("intermediate_size", None)
+        self.hidden_act = kwargs.get("hidden_act", "silu")
+        self.initializer_range = kwargs.get("initializer_range", 0.02)
+        self.use_cache = kwargs.get("use_cache", True)
+        self.max_length = kwargs.get("max_length", 32768)
+        self.bos_token_id = kwargs.get("bos_token_id", 0)
+        self.eos_token_id = kwargs.get("eos_token_id", 1)
+        self.flash_attention = kwargs.get("flash_attention", True if torch.cuda.is_available() else False)
+        rope_scaling_params = kwargs.get("rope_scaling_params", None)
+        self.rope_theta = kwargs.get("rope_theta", 100000.0)
+        
+        # MoE parameters
+        self.use_moe = kwargs.get("use_moe", False)
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_expert_per_token = kwargs.get("num_expert_per_token", 2)
+        self.aux_loss_coef = kwargs.get("aux_loss_coef", 0.01)
+        
+        # Engram parameters
+        self.use_engrams = kwargs.get("use_engrams", False)
+        self.engram_vocab_size = kwargs.get("engram_vocab_size", 1024)
+        self.engram_n_layer_list = kwargs.get("engram_n_layer_list", [1])
+        self.engram_n_gram_list = kwargs.get("engram_n_gram_list", [2, 3])
+        self.engram_num_heads = kwargs.get("engram_num_heads", 4)
+        self.engram_conv_size = kwargs.get("engram_conv_size", 3)
+        self.engram_hash_seed = kwargs.get("engram_hash_seed", 17)
+        
         self.rope_factors = {
             "beta_fast": 16.0,
             "beta_slow": 1.0,
@@ -69,17 +50,6 @@ class MiniGramConfig(PretrainedConfig):
             "attention_factor": 1.0,
             "type": "yarn"
         } if rope_scaling_params is None else rope_scaling_params
-        self.use_moe = use_moe
-        self.num_experts = num_experts
-        self.num_expert_per_token = num_expert_per_token
-        self.aux_loss_coef = aux_loss_coef
-        self.use_engrams = use_engrams
-        self.engram_vocab_size = engram_vocab_size
-        self.engram_n_layer_list = engram_n_layer_list
-        self.engram_n_gram_list = engram_n_gram_list
-        self.engram_num_heads = engram_num_heads
-        self.engram_conv_size = engram_conv_size
-        self.engram_hash_seed = engram_hash_seed
 
 
 from transformers.activations import ACT2FN

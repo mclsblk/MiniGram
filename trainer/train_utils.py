@@ -135,12 +135,15 @@ def load_checkpoint(path, model, optimizer=None, map_location="cpu") -> dict:
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     state = torch.load(path, map_location=map_location)
     raw_model = _unwrap_model(model)
-    raw_model.load_state_dict(state["model"], strict=True)
+    try:
+        raw_model.load_state_dict(state["model"], strict=True)
+    except:
+        raw_model.load_state_dict(state, strict=False)
 
     if optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
     
-    step = state.get("step", 0)
+    step = state.get("step", {})
     epoch = step.get("epoch", 0)
     epoch_step = step.get("epoch_step", 0)
     return state, epoch, epoch_step
