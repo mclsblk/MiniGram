@@ -2,13 +2,14 @@ from datasets import load_dataset
 import json
 import torch
 from torch.utils.data import Dataset
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class PretrainDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length=512, text_field=None):
+    def __init__(self, data_path, tokenizer, max_length=512):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.text_field = text_field
         self.data = load_dataset("json", data_files=data_path, split="train")
 
         if self.tokenizer.pad_token_id is None:
@@ -40,6 +41,7 @@ class PretrainDataset(Dataset):
         padded_labels = input_ids[:seq_len] + [-100] * (self.max_length - seq_len)
 
         return torch.tensor(padded_input_ids, dtype=torch.long), torch.tensor(padded_labels, dtype=torch.long)
+
 
 class SFTDataset(Dataset):
     def __init__(
@@ -91,8 +93,6 @@ class SFTDataset(Dataset):
             value = turn.get(key).strip()
             if value is not None and value != "":
                 tool_call_texts.append(value)
-            else:
-                continue
         return "\n".join(tool_call_texts)
 
     def _normalize_messages(self, sample: dict):

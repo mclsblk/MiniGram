@@ -32,7 +32,6 @@ def parse_args():
 
     # data/tokenizer
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t.jsonl", help="Path to JSON/JSONL pretraining data file")
-    parser.add_argument("--text_field", type=str, default=None, help="Text field name in dataset rows")
     parser.add_argument("--tokenizer_path", type=str, default="../model", help="Tokenizer path/name for AutoTokenizer")
     parser.add_argument("--max_length", type=int, default=340, help="Sequence length")
 
@@ -87,8 +86,7 @@ def main():
     train_ds = PretrainDataset(
         data_path=args.data_path,
         tokenizer=tokenizer,
-        max_length=args.max_length,
-        text_field=args.text_field,
+        max_length=args.max_length
     )
     pin_memory = device_type == "cuda"
     train_loader = DataLoader(
