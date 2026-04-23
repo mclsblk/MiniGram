@@ -9,6 +9,25 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
 
 
+def _build_prompt(tokenizer, user_text, history, with_history=False):
+    messages = []
+    if with_history and history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    prompt = ""
+    for message in messages:
+        prompt += f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+
+
 def init_model(args):
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
@@ -17,14 +36,11 @@ def init_model(args):
     # Load pretrained weights if specified
     if args.pretrained_model_path:    
         config = MiniGramConfig(
-            vocab_size=tokenizer.vocab_size,
+            vocab_size=len(tokenizer),
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
-            use_engrams=args.use_engrams,
-            # Edit Engram defaults/behavior in model/model_minigram.py rather than expanding inference CLI args.
-            engram_vocab_size=args.engram_vocab_size,
-            max_length=args.max_length,
-            bos_token_id=tokenizer.bos_token_id,
+            use_engrams=bool(args.use_engrams),
+            engram_vocab_size=args.engram_vocab_size,            bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
@@ -45,12 +61,12 @@ def init_model(args):
 
 def generate(args, tokenizer, model, conversation, history=None):
     # Prepare input prompt
-    prompt = ""
-    if args.with_history and history:
-        for turn in history:
-            prompt += f"{turn['role']}: {turn['content']}\n"
-    prompt += f"user: {conversation['user']}\nassistant:"  # Add assistant role to prompt for generation
-    prompt += "\n"  # Ensure prompt ends with newline for better formatting
+    prompt = _build_prompt(
+        tokenizer=tokenizer,
+        user_text=conversation["user"],
+        history=history,
+        with_history=bool(args.with_history),
+    )
     model_inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = model_inputs["input_ids"].to(args.device)
     attention_mask = model_inputs.get("attention_mask")
@@ -59,10 +75,9 @@ def generate(args, tokenizer, model, conversation, history=None):
     else:
         attention_mask = attention_mask.to(args.device)
 
-    # Generate output with streaming
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     print("Generated response:", end=" ", flush=True)
-    with torch.no_grad():
+    with torch.inference_mode():
         generate_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -73,6 +88,7 @@ def generate(args, tokenizer, model, conversation, history=None):
             "do_sample": True,
             "top_p": args.top_p,
             "temperature": args.temperature,
+            "use_cache": True,
         }
         answer = model.generate(**generate_kwargs)
     generated_tokens = answer[0, input_ids.size(1):]
@@ -95,11 +111,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run inference on")
 
     args = parser.parse_args()
-
     tokenizer, model = init_model(args)
-    history = []
 
-    print("MiniGram Inference. Type 'exit' or 'quit' to stop.")
+    history = []
+    print("MiniGram Inference Chat. Type 'exit' or 'quit' to stop.")
     while True:
         user_input = input("User: ")
         if user_input.lower() in ["exit", "quit"]:
@@ -109,7 +124,7 @@ def main():
         conversation = generate(args, tokenizer, model, conversation, history)
         if args.with_history:
             if args.with_history < len(history) // 2:
-                history = history[-(args.with_history * 2 - 2):]  # Keep only the last N - 1 turns (user + assistant)
+                history = history[-(args.with_history * 2):]  # Keep only the last N full turns (user + assistant)
             history.append({"role": "user", "content": user_input})
             history.append({"role": "assistant", "content": conversation["answer"]})
 
