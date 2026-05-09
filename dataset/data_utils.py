@@ -1,8 +1,8 @@
 from datasets import load_dataset
-import json
 import torch
 from torch.utils.data import Dataset
 import os
+from dataset.chat_utils import normalize_conversations, render_chat_prompt
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -34,10 +34,10 @@ class PretrainDataset(Dataset):
             add_special_tokens=False,
         ).input_ids
 
-        input_ids = [self.bos_token_id] + token_ids + [self.eos_token_id]
+        input_ids = [self.tokenizer.bos_token_id] + token_ids + [self.tokenizer.eos_token_id]
         seq_len = min(len(input_ids), self.max_length)
 
-        padded_input_ids = input_ids[:seq_len] + [self.pad_token_id] * (self.max_length - seq_len)
+        padded_input_ids = input_ids[:seq_len] + [self.tokenizer.pad_token_id] * (self.max_length - seq_len)
         padded_labels = input_ids[:seq_len] + [-100] * (self.max_length - seq_len)
 
         return torch.tensor(padded_input_ids, dtype=torch.long), torch.tensor(padded_labels, dtype=torch.long)
@@ -78,66 +78,6 @@ class SFTDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def _stringify_content(self, content) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, (dict, list)):
-            return json.dumps(content, ensure_ascii=False).strip()
-        return str(content).strip()
-
-    def _extract_tool_call_text(self, turn: dict) -> str:
-        tool_call_texts = []
-        for key in ("tool_call", "tool_calls"):
-            value = turn.get(key).strip()
-            if value is not None and value != "":
-                tool_call_texts.append(value)
-        return "\n".join(tool_call_texts)
-
-    def _normalize_messages(self, sample: dict):
-        conversations = sample["conversations"]
-
-        tools = None
-        if conversations:
-            first_turn = conversations[0]
-            if isinstance(first_turn, dict) and first_turn.get("role") == "system":
-                tools = first_turn.get("functions")
-
-        messages = []
-        for turn in conversations:
-            role = turn["role"]
-            content = self._stringify_content(turn.get("content"))
-            tool_call_text = self._extract_tool_call_text(turn)
-
-            if role == "assistant":
-                assistant_parts = [part for part in (content, tool_call_text) if part]
-                content = "\n".join(assistant_parts).strip()
-                if not content:
-                    continue
-            elif role != "assistant" and not content:
-                continue
-
-            messages.append({"role": role, "content": content})
-
-        if not messages:
-            raise ValueError("SFT sample produced no usable chat messages.")
-        return messages, tools
-
-    def _render_prompt(self, messages, tools):
-        if tools is not None:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                tools=tools,
-            )
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
     def _generate_labels(self, input_ids):
         labels = [-100] * len(input_ids)
         i = 0
@@ -157,8 +97,13 @@ class SFTDataset(Dataset):
         return labels
 
     def _build_example(self, sample: dict):
-        messages, tools = self._normalize_messages(sample)
-        prompt = self._render_prompt(messages, tools)
+        messages, tools = normalize_conversations(sample)
+        prompt = render_chat_prompt(
+            self.tokenizer,
+            messages,
+            tools=tools,
+            add_generation_prompt=False,
+        )
         input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids[: self.max_length]
         if not input_ids:
             raise ValueError("SFT sample produced empty tokenized input.")
@@ -183,3 +128,32 @@ class SFTDataset(Dataset):
             f"Failed to build a valid SFT sample after {self.max_skip_attempts} attempts "
             f"starting from index {idx}. Last error: {last_error}"
         )
+
+
+class GRPODataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_length=512):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.data = load_dataset("json", data_files=data_path, split="train")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        conversations = sample["conversations"]
+        reference = ""
+        prompt_conversations = conversations
+        if conversations and conversations[-1].get("role") == "assistant":
+            reference = conversations[-1].get("content") or ""
+            prompt_conversations = conversations[:-1]
+
+        messages, tools = normalize_conversations(prompt_conversations)
+        prompt = render_chat_prompt(
+            self.tokenizer,
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        return {"prompt": prompt, "reference": reference}
