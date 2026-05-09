@@ -63,6 +63,23 @@ def log(msg: str) -> None:
     print(f"[{now}] {msg}", flush=True)
 
 
+def format_eta(seconds: float) -> str:
+    minutes = max(0.0, float(seconds)) / 60.0
+    return f"{minutes:.2f}min"
+
+
+def get_remaining_time(global_step: int, total_steps: int, start_step: int, start_time: float) -> float:
+    used_steps = max(1, global_step - start_step)
+    used_time = (datetime.now() - datetime.fromtimestamp(start_time)).total_seconds()
+    remaining_steps = max(0, total_steps - global_step)
+    return remaining_steps * (used_time / used_steps)
+
+
+def log_train_metrics(prefix: str, metrics: dict, lr: float, eta_seconds: float) -> None:
+    metric_text = " ".join(f"{key}={value:.4f}" for key, value in metrics.items())
+    log(f"{prefix} {metric_text} lr={lr:.7f} eta={format_eta(eta_seconds)}")
+
+
 def _unwrap_model(model):
     if hasattr(model, "module"):
         model = model.module
@@ -101,6 +118,33 @@ def get_param(model):
         "total_params_human": _human_count(total_params),
         "trainable_params_human": _human_count(trainable_params)
     }
+
+
+def init_model(args, device, device_type, checkpoint_path=None, use_cache=False, map_location="cpu"):
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    lm_config = MiniGramConfig(
+        vocab_size=len(tokenizer),
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_engrams=bool(args.use_engrams),
+        use_cache=use_cache,
+        flash_attention=True if device_type == "cuda" else False,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        engram_vocab_size=args.engram_vocab_size if args.use_engrams else None,
+        use_moe=bool(getattr(args, "use_moe", 0)),
+    )
+    model = MiniGramForCausalLM(lm_config).to(device)
+
+    if checkpoint_path is not None:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        load_checkpoint(checkpoint_path, model, optimizer=None, map_location=map_location)
+
+    return model, tokenizer
 
 
 def save_checkpoint(path, model, name, optimizer, step, model_dtype=torch.float16):

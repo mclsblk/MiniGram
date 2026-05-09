@@ -6,19 +6,20 @@ import time
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dataset.data_utils import SFTDataset
-from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
 from trainer.train_utils import (
     build_amp,
     get_param,
     get_lr,
+    get_remaining_time,
+    init_model,
     load_checkpoint,
     log,
+    log_train_metrics,
     save_checkpoint,
     save_model_only,
     set_seed,
@@ -88,9 +89,18 @@ def main():
     log(f"Using device={device}, dtype={args.dtype}")
     # TODO: add DDP support in a future pass.
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if args.resume_from and args.init_from:
+        log("Both init_from and resume_from were set. resume_from takes precedence.")
+    init_checkpoint = args.init_from if args.resume_from is None else None
+    model, tokenizer = init_model(
+        args,
+        device=device,
+        device_type=device_type,
+        checkpoint_path=init_checkpoint,
+        use_cache=False,
+    )
+    if init_checkpoint is not None:
+        log(f"Loaded initial weights from {init_checkpoint}")
 
     train_ds = SFTDataset(
         data_path=args.data_path,
@@ -110,18 +120,6 @@ def main():
     if len(train_loader) == 0:
         raise ValueError("Training dataloader is empty. Lower batch_size or provide more data.")
 
-    lm_config = MiniGramConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        use_engrams=bool(args.use_engrams),
-        use_cache=False,
-        flash_attention=True if device_type == "cuda" else False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        engram_vocab_size=args.engram_vocab_size if args.use_engrams else None,
-    )
-    model = MiniGramForCausalLM(lm_config).to(device)
     if args.use_compile == 1:
         model = torch.compile(model)
         log("torch.compile enabled")
@@ -135,14 +133,6 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     autocast_ctx, scaler = build_amp(args.dtype, device_type)
 
-    if args.resume_from and args.init_from:
-        log("Both init_from and resume_from were set. resume_from takes precedence.")
-    elif args.resume_from is None and args.init_from is not None:
-        if not os.path.exists(args.init_from):
-            raise FileNotFoundError(f"Checkpoint not found: {args.init_from}")
-        load_checkpoint(args.init_from, model, optimizer=None, map_location="cpu")
-        log(f"Loaded initial weights from {args.init_from}")
-
     steps_per_epoch = len(train_loader)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = int(total_steps * args.warmup_ratio)
@@ -154,7 +144,8 @@ def main():
     if args.resume_from:
         state, start_epoch, resume_step = load_checkpoint(args.resume_from, model, optimizer=optimizer, map_location="cpu")
         start_epoch = int(state.get("epoch", 0))
-        global_step = start_epoch * steps_per_epoch + resume_step
+        global_step = (start_epoch * steps_per_epoch) + resume_step
+        start_step = global_step
         log(
             "Resumed from checkpoint "
             f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_step})"
@@ -162,7 +153,7 @@ def main():
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    global_start = time.time()
+    start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
@@ -205,18 +196,18 @@ def main():
             aux_loss_value = float(aux_loss.detach().item())
             total_loss_value = logits_loss_value + aux_loss_value
 
-            current_time = time.time()
-            used_time = current_time - global_start
-            used_steps = global_step - (start_epoch * steps_per_epoch) - resume_step
-            remaining_steps = max(0, total_steps - global_step)
-            remaining_time = remaining_steps * (used_time / used_steps)
-
             if (global_step % args.log_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                log(
-                    f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps}) "
-                    f"loss={total_loss_value:.4f} logits_loss={logits_loss_value:.4f} "
-                    f"aux_loss={aux_loss_value:.4f} lr={lr:.7f} "
-                    f"eta={remaining_time / 60:.2f}min"
+
+                remaining_time = get_remaining_time(global_step, total_steps, start_step, start_time)
+                log_train_metrics(
+                    prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
+                    metrics={
+                        "loss": total_loss_value,
+                        "logits_loss": logits_loss_value,
+                        "aux_loss": aux_loss_value,
+                    },
+                    lr=lr,
+                    eta_seconds=remaining_time,
                 )
 
             if (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:

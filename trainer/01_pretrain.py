@@ -6,19 +6,20 @@ import time
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dataset.data_utils import PretrainDataset
-from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
 from trainer.train_utils import (
     build_amp,
     get_param,
     get_lr,
+    get_remaining_time,
+    init_model,
     load_checkpoint,
     log,
+    log_train_metrics,
     save_checkpoint,
     save_model_only,
     set_seed,
@@ -36,7 +37,7 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=340, help="Sequence length")
 
     # model
-    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_hidden_layers", type=int, default=12)
     parser.add_argument("--use_moe", type=int, default=0, choices=[0, 1], help="Enable Mixture of Experts (MoE) layers")
     parser.add_argument("--use_engrams", type=int, default=0, choices=[0, 1], help="Enable engram blocks")
@@ -79,9 +80,7 @@ def main():
     log(f"Using device={device}, dtype={args.dtype}")
     # TODO: add DDP support in a future pass.
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model, tokenizer = init_model(args, device=device, device_type=device_type, use_cache=False)
 
     train_ds = PretrainDataset(
         data_path=args.data_path,
@@ -97,20 +96,6 @@ def main():
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
-
-    lm_config = MiniGramConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        use_engrams=bool(args.use_engrams),
-        use_cache=False,
-        flash_attention=True if device_type == "cuda" else False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        engram_vocab_size=args.engram_vocab_size if args.use_engrams else None,
-        use_moe=args.use_moe
-    )
-    model = MiniGramForCausalLM(lm_config).to(device)
 
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -187,18 +172,22 @@ def main():
             aux_loss_value = float(aux_loss.detach().item())
             total_loss_value = logits_loss_value + aux_loss_value
 
-            current_time = time.time()
-            used_time = current_time - global_start
-            used_steps = global_step - (start_epoch * steps_per_epoch) - resume_step
-            remaining_steps = max(0, total_steps - global_step)
-            remaining_time = remaining_steps * (used_time / used_steps)
-
             if (global_step % args.log_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                log(
-                    f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps}) "
-                    f"loss={total_loss_value:.4f} logits_loss={logits_loss_value:.4f} "
-                    f"aux_loss={aux_loss_value:.4f} lr={lr:.7f} "
-                    f"eta={remaining_time / 60:.2f}min"
+                remaining_time = get_remaining_time(
+                    global_step=global_step,
+                    total_steps=total_steps,
+                    start_step=(start_epoch * steps_per_epoch) + resume_step,
+                    start_time=global_start,
+                )
+                log_train_metrics(
+                    prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
+                    metrics={
+                        "loss": total_loss_value,
+                        "logits_loss": logits_loss_value,
+                        "aux_loss": aux_loss_value,
+                    },
+                    lr=lr,
+                    eta_seconds=remaining_time,
                 )
 
             if (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
@@ -207,7 +196,7 @@ def main():
                                 step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model.dtype)
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
         log(f"Epoch {epoch + 1} complete.")
-    save_model_only(args.save_dir, model=model,name=args.save_name)
+    save_model_only(args.save_dir, model=model)
     log("Training complete.")
 
 
