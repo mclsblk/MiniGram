@@ -145,11 +145,11 @@ def main():
         state, start_epoch, resume_step = load_checkpoint(args.resume_from, model, optimizer=optimizer, map_location="cpu")
         start_epoch = int(state.get("epoch", 0))
         global_step = (start_epoch * steps_per_epoch) + resume_step
-        start_step = global_step
         log(
             "Resumed from checkpoint "
             f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_step})"
         )
+    start_step = global_step
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
