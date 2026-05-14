@@ -89,12 +89,24 @@ class SFTDataset(Dataset):
                     if input_ids[end : end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                for j in range(start, min(end + len(self.eos_id), len(input_ids))):
                     labels[j] = input_ids[j]
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1
         return labels
+
+    def _truncate_with_supervision(self, input_ids, labels):
+        if len(input_ids) <= self.max_length:
+            return input_ids, labels
+
+        supervised_positions = [i for i, label in enumerate(labels) if label != -100]
+        if not supervised_positions:
+            return input_ids[: self.max_length], labels[: self.max_length]
+
+        end = supervised_positions[-1] + 1
+        start = max(0, end - self.max_length)
+        return input_ids[start:end], labels[start:end]
 
     def _build_example(self, sample: dict):
         messages, tools = normalize_conversations(sample)
@@ -104,14 +116,18 @@ class SFTDataset(Dataset):
             tools=tools,
             add_generation_prompt=False,
         )
-        input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids[: self.max_length]
+        input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
         if not input_ids:
             raise ValueError("SFT sample produced empty tokenized input.")
 
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self._generate_labels(input_ids)
+        if self.train_on_prompt:
+            labels = input_ids.copy()
+        input_ids, labels = self._truncate_with_supervision(input_ids, labels)
         if all(label == -100 for label in labels):
             raise ValueError("SFT sample has no supervised tokens after formatting/truncation.")
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        labels += [-100] * (self.max_length - len(labels))
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
     def __getitem__(self, idx):

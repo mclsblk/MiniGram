@@ -196,7 +196,7 @@ def main():
                                 step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model.dtype)
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
         log(f"Epoch {epoch + 1} complete.")
-    save_model_only(args.save_dir, model=model)
+    save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model.dtype)
     log("Training complete.")
 
 
