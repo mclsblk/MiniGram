@@ -1,0 +1,19 @@
+# exclude all *.pth files 
+*.pth
+
+# exclude all data files
+*.json
+*.jsonl
+
+# exclude all .pyc files
+*.pyc
+
+# exclude other common files and directories
+.vscode/
+.agents/
+.codex
+train_log
+citation/
+
+# temporarily exclude tokenizer/
+tokenizer/
