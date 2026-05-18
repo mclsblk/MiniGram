@@ -80,6 +80,27 @@ def normalize_conversations(sample_or_conversations, include_empty_assistant: bo
     return messages, tools
 
 
+def inject_system_prompt(messages, system_prompt: Optional[str] = None):
+    system_content = stringify_content(system_prompt)
+    if not system_content:
+        return messages
+
+    messages = list(messages)
+    if messages and messages[0].get("role") == "system":
+        existing_content = stringify_content(messages[0].get("content"))
+        if existing_content == system_content:
+            return messages
+
+        merged_messages = list(messages)
+        merged_messages[0] = {
+            "role": "system",
+            "content": "\n".join(part for part in (system_content, existing_content) if part),
+        }
+        return merged_messages
+
+    return [{"role": "system", "content": system_content}] + messages
+
+
 def render_chat_prompt(tokenizer, messages, tools=None, add_generation_prompt: bool = False) -> str:
     if getattr(tokenizer, "chat_template", None):
         kwargs = {

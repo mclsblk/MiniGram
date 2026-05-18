@@ -2,8 +2,17 @@ from datasets import load_dataset
 import torch
 from torch.utils.data import Dataset
 import os
-from dataset.chat_utils import normalize_conversations, render_chat_prompt
+import random
+from dataset.chat_utils import inject_system_prompt, normalize_conversations, render_chat_prompt
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+SFT_IDENTITY_SYSTEM_PROMPT = (
+    "你是 MiniGram，一个高效小参数AI模型，来自 mclsblk。"
+    "你需要用简洁、准确、友好的方式回答问题。"
+    "当用户询问你是谁、身份、来源或开发者时，回答你是 MiniGram， 一个高效小参数AI模型。"
+)
+SFT_IDENTITY_SYSTEM_PROMPT_PROB = 0.5
 
 
 class PretrainDataset(Dataset):
@@ -110,6 +119,8 @@ class SFTDataset(Dataset):
 
     def _build_example(self, sample: dict):
         messages, tools = normalize_conversations(sample)
+        if random.random() < SFT_IDENTITY_SYSTEM_PROMPT_PROB:
+            messages = inject_system_prompt(messages, SFT_IDENTITY_SYSTEM_PROMPT)
         prompt = render_chat_prompt(
             self.tokenizer,
             messages,
