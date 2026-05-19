@@ -12,6 +12,18 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dataset.data_utils import SFTDataset
 from model.lora import apply_lora, mark_only_lora_as_trainable
+from trainer.ddp_utils import (
+    barrier,
+    build_distributed_sampler,
+    build_worker_seed_fn,
+    cleanup_distributed,
+    get_model_dtype,
+    init_distributed,
+    rank0_log,
+    reduce_metrics,
+    set_sampler_epoch,
+    wrap_ddp,
+)
 from trainer.lora_utils import (
     load_lora_adapter,
     load_lora_checkpoint,
@@ -87,12 +99,23 @@ def parse_args():
 
 def main():
     args = parse_args()
-    os.makedirs(args.save_dir, exist_ok=True)
 
-    device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    device_type = "cuda" if "cuda" in device else "cpu"
-    set_seed(args.seed, deterministic=False)
-    log(f"Using device={device}, dtype={args.dtype}")
+    ddp_state = init_distributed(args)
+    if ddp_state.is_main:
+        os.makedirs(args.save_dir, exist_ok=True)
+    barrier(ddp_state)
+
+    device = ddp_state.device
+    device_type = ddp_state.device_type
+    set_seed(args.seed + ddp_state.rank, deterministic=False)
+
+    def log_info(msg):
+        rank0_log(ddp_state, msg, log)
+
+    log_info(
+        f"Using device={device}, dtype={args.dtype}, "
+        f"ddp={ddp_state.enabled}, rank={ddp_state.rank}/{ddp_state.world_size}"
+    )
 
     targets = parse_targets(args.lora_target_modules)
     config = lora_config(args.lora_r, args.lora_alpha, args.lora_dropout, targets)
@@ -104,14 +127,14 @@ def main():
         checkpoint_path=args.init_from,
         use_cache=False,
     )
-    log(f"Loaded SFT base weights from {args.init_from}")
+    log_info(f"Loaded SFT base weights from {args.init_from}")
 
     replaced = apply_lora(model, targets, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout)
-    log(f"Applied LoRA to {replaced} modules: {','.join(targets)}")
+    log_info(f"Applied LoRA to {replaced} modules: {','.join(targets)}")
 
     if args.adapter_path and not args.resume_from:
         load_lora_adapter(args.adapter_path, model, config=config)
-        log(f"Loaded initial LoRA adapter from {args.adapter_path}")
+        log_info(f"Loaded initial LoRA adapter from {args.adapter_path}")
 
     mark_only_lora_as_trainable(model)
 
@@ -122,23 +145,36 @@ def main():
         train_on_prompt=bool(args.train_on_prompt),
     )
     pin_memory = device_type == "cuda"
+    train_sampler = build_distributed_sampler(
+        train_ds,
+        ddp_state,
+        shuffle=True,
+        drop_last=True,
+        seed=args.seed,
+    )
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed + ddp_state.rank)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=train_sampler is None,
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=build_worker_seed_fn(args.seed, ddp_state.rank),
+        generator=loader_generator,
     )
     if len(train_loader) == 0:
         raise ValueError("Training dataloader is empty. Lower batch_size or provide more data.")
 
     if args.use_compile == 1:
         model = torch.compile(model)
-        log("torch.compile enabled")
+        log_info("torch.compile enabled")
+    model = wrap_ddp(model, ddp_state)
 
     param_info = get_param(model)
-    log(
+    log_info(
         "Model size: "
         f"total={param_info['total_params_human']} ({param_info['total_params']}) "
         f"trainable={param_info['trainable_params_human']} ({param_info['trainable_params']}) "
@@ -159,7 +195,7 @@ def main():
     if args.resume_from:
         _, start_epoch, resume_step = load_lora_checkpoint(args.resume_from, model, optimizer, config=config)
         global_step = (start_epoch * steps_per_epoch) + resume_step
-        log(
+        log_info(
             "Resumed LoRA checkpoint "
             f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_step})"
         )
@@ -170,6 +206,7 @@ def main():
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
+        set_sampler_epoch(train_sampler, epoch)
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx < resume_step:
                 continue
@@ -209,20 +246,26 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
 
             if global_step % args.log_interval == 0 or global_step == total_steps:
-                remaining_time = get_remaining_time(global_step, total_steps, start_step, start_time)
-                log_train_metrics(
-                    prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
-                    metrics={
-                        "loss": float(total_loss.detach().item()),
-                        "logits_loss": float(logits_loss.detach().item()),
-                        "aux_loss": float(aux_loss.detach().item()),
+                reduced_metrics = reduce_metrics(
+                    {
+                        "loss": total_loss,
+                        "logits_loss": logits_loss,
+                        "aux_loss": aux_loss,
                     },
-                    lr=lr,
-                    eta_seconds=remaining_time,
+                    ddp_state,
                 )
+                remaining_time = get_remaining_time(global_step, total_steps, start_step, start_time)
+                if ddp_state.is_main:
+                    log_train_metrics(
+                        prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
+                        metrics=reduced_metrics,
+                        lr=lr,
+                        eta_seconds=remaining_time,
+                    )
 
-            if global_step % args.save_interval == 0 or global_step == total_steps:
-                save_lora_model_only(args.save_dir, model, args.save_name, config, args.init_from, dtype=model.dtype)
+            if ddp_state.is_main and (global_step % args.save_interval == 0 or global_step == total_steps):
+                model_dtype = get_model_dtype(model)
+                save_lora_model_only(args.save_dir, model, args.save_name, config, args.init_from, dtype=model_dtype)
                 save_lora_checkpoint(
                     args.save_dir,
                     model,
@@ -231,17 +274,20 @@ def main():
                     {"epoch": epoch, "epoch_step": batch_idx + 1},
                     config,
                     args.init_from,
-                    dtype=model.dtype,
+                    dtype=model_dtype,
                 )
 
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
 
-        log(f"Epoch {epoch + 1} complete.")
+        log_info(f"Epoch {epoch + 1} complete.")
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-    save_lora_model_only(args.save_dir, model, args.save_name, config, args.init_from, dtype=model.dtype)
-    log("LoRA training complete.")
+    if ddp_state.is_main:
+        save_lora_model_only(args.save_dir, model, args.save_name, config, args.init_from, dtype=get_model_dtype(model))
+        log("LoRA training complete.")
+    barrier(ddp_state)
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

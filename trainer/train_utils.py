@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
+from trainer.ddp_utils import unwrap_model
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -81,10 +82,7 @@ def log_train_metrics(prefix: str, metrics: dict, lr: float, eta_seconds: float)
 
 
 def _unwrap_model(model):
-    if hasattr(model, "module"):
-        model = model.module
-    model = getattr(model, "_orig_mod", model)
-    return model
+    return unwrap_model(model)
 
 
 def _cpu_state_dict(state_dict, dtype=None):

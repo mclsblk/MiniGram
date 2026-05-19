@@ -11,6 +11,18 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from dataset.data_utils import SFTDataset
+from trainer.ddp_utils import (
+    barrier,
+    build_distributed_sampler,
+    build_worker_seed_fn,
+    cleanup_distributed,
+    get_model_dtype,
+    init_distributed,
+    rank0_log,
+    reduce_metrics,
+    set_sampler_epoch,
+    wrap_ddp,
+)
 from trainer.train_utils import (
     build_amp,
     get_param,
@@ -80,17 +92,26 @@ def parse_args():
 
 def main():
     args = parse_args()
-    os.makedirs(args.save_dir, exist_ok=True)
 
-    device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    device_type = "cuda" if "cuda" in device else "cpu"
-    set_seed(args.seed, deterministic=False)
+    ddp_state = init_distributed(args)
+    if ddp_state.is_main:
+        os.makedirs(args.save_dir, exist_ok=True)
+    barrier(ddp_state)
 
-    log(f"Using device={device}, dtype={args.dtype}")
-    # TODO: add DDP support in a future pass.
+    device = ddp_state.device
+    device_type = ddp_state.device_type
+    set_seed(args.seed + ddp_state.rank, deterministic=False)
+
+    def log_info(msg):
+        rank0_log(ddp_state, msg, log)
+
+    log_info(
+        f"Using device={device}, dtype={args.dtype}, "
+        f"ddp={ddp_state.enabled}, rank={ddp_state.rank}/{ddp_state.world_size}"
+    )
 
     if args.resume_from and args.init_from:
-        log("Both init_from and resume_from were set. resume_from takes precedence.")
+        log_info("Both init_from and resume_from were set. resume_from takes precedence.")
     init_checkpoint = args.init_from if args.resume_from is None else None
     model, tokenizer = init_model(
         args,
@@ -100,7 +121,7 @@ def main():
         use_cache=False,
     )
     if init_checkpoint is not None:
-        log(f"Loaded initial weights from {init_checkpoint}")
+        log_info(f"Loaded initial weights from {init_checkpoint}")
 
     train_ds = SFTDataset(
         data_path=args.data_path,
@@ -109,22 +130,35 @@ def main():
         train_on_prompt=bool(args.train_on_prompt),
     )
     pin_memory = device_type == "cuda"
+    train_sampler = build_distributed_sampler(
+        train_ds,
+        ddp_state,
+        shuffle=True,
+        drop_last=True,
+        seed=args.seed,
+    )
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed + ddp_state.rank)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=train_sampler is None,
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=build_worker_seed_fn(args.seed, ddp_state.rank),
+        generator=loader_generator,
     )
     if len(train_loader) == 0:
         raise ValueError("Training dataloader is empty. Lower batch_size or provide more data.")
 
     if args.use_compile == 1:
         model = torch.compile(model)
-        log("torch.compile enabled")
+        log_info("torch.compile enabled")
+    model = wrap_ddp(model, ddp_state)
     param_info = get_param(model)
-    log(
+    log_info(
         "Model size: "
         f"total={param_info['total_params_human']} ({param_info['total_params']}) "
         f"trainable={param_info['trainable_params_human']} ({param_info['trainable_params']}) "
@@ -145,7 +179,7 @@ def main():
         state, start_epoch, resume_step = load_checkpoint(args.resume_from, model, optimizer=optimizer, map_location="cpu")
         start_epoch = int(state.get("epoch", 0))
         global_step = (start_epoch * steps_per_epoch) + resume_step
-        log(
+        log_info(
             "Resumed from checkpoint "
             f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_step})"
         )
@@ -156,6 +190,7 @@ def main():
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
+        set_sampler_epoch(train_sampler, epoch)
         for batch_idx, batch in enumerate(train_loader):
             if epoch == start_epoch and batch_idx < resume_step:
                 continue
@@ -197,27 +232,36 @@ def main():
             total_loss_value = logits_loss_value + aux_loss_value
 
             if (global_step % args.log_interval == 0 or global_step == total_steps) and batch_idx > 0:
-
-                remaining_time = get_remaining_time(global_step, total_steps, start_step, start_time)
-                log_train_metrics(
-                    prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
-                    metrics={
+                reduced_metrics = reduce_metrics(
+                    {
                         "loss": total_loss_value,
                         "logits_loss": logits_loss_value,
                         "aux_loss": aux_loss_value,
                     },
-                    lr=lr,
-                    eta_seconds=remaining_time,
+                    ddp_state,
                 )
 
-            if (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model.dtype)
+                remaining_time = get_remaining_time(global_step, total_steps, start_step, start_time)
+                if ddp_state.is_main:
+                    log_train_metrics(
+                        prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
+                        metrics=reduced_metrics,
+                        lr=lr,
+                        eta_seconds=remaining_time,
+                    )
+
+            if ddp_state.is_main and (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
+                model_dtype = get_model_dtype(model)
+                save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model_dtype)
                 save_checkpoint(args.save_dir, model=model, name=args.save_name, optimizer=optimizer,
-                                step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model.dtype)
+                                step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model_dtype)
             del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
-        log(f"Epoch {epoch + 1} complete.")
-    save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model.dtype)
-    log("Training complete.")
+        log_info(f"Epoch {epoch + 1} complete.")
+    if ddp_state.is_main:
+        save_model_only(args.save_dir, model=model, name=args.save_name, dtype=get_model_dtype(model))
+        log("Training complete.")
+    barrier(ddp_state)
+    cleanup_distributed()
 
 if __name__ == "__main__":
     main()
