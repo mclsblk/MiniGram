@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 import torch
 from torch import optim
@@ -48,8 +49,9 @@ def parse_args():
 
     # rollout/grpo
     parser.add_argument("--num_generations", type=int, default=4, help="Number of completions per prompt")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Rollout sampling temperature")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Rollout top-p sampling")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Rollout sampling temperature")
+    parser.add_argument("--top_p", type=float, default=1.0, help="Rollout top-p sampling")
+    parser.add_argument("--num_iterations", type=int, default=4, help="Policy updates per rollout batch")
     parser.add_argument("--beta", type=float, default=0.1, help="KL penalty coefficient")
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO clip epsilon")
 
@@ -68,6 +70,7 @@ def parse_args():
     parser.add_argument("--use_compile", type=int, default=0, choices=[0, 1], help="Enable torch.compile")
     parser.add_argument("--max_steps", type=int, default=0, help="Stop after N micro-batches when > 0")
     parser.add_argument("--reward_model_path", type=str, default="default", help="Reward model path (default uses simple heuristics)")
+    parser.add_argument("--reward_max_len", type=int, default=1024, help="Maximum reward model input length")
 
     # init/output
     parser.add_argument("--init_from", type=str, default="./out/minigram_sft.pth", help="SFT checkpoint used for policy and reference")
@@ -88,8 +91,42 @@ def _build_output_attention_mask(prompt_attention_mask, completion_ids, num_gene
     return torch.cat([repeated_prompt_mask, completion_attention_mask], dim=1)
 
 
+def validate_args(args):
+    if args.num_generations < 2:
+        raise ValueError("--num_generations must be >= 2 for group-normalized GRPO advantages.")
+    if args.num_iterations < 1:
+        raise ValueError("--num_iterations must be >= 1.")
+    if args.accumulation_steps < 1:
+        raise ValueError("--accumulation_steps must be >= 1.")
+    if args.num_iterations > 1 and args.accumulation_steps != 1:
+        raise ValueError("--accumulation_steps > 1 is only supported when --num_iterations is 1.")
+    if args.log_interval < 1 or args.save_interval < 1:
+        raise ValueError("--log_interval and --save_interval must be >= 1.")
+    if args.temperature <= 0:
+        raise ValueError("--temperature must be > 0.")
+    if not 0 < args.top_p <= 1:
+        raise ValueError("--top_p must be in (0, 1].")
+    if args.temperature != 1.0 or args.top_p != 1.0:
+        raise ValueError(
+            "This GRPO implementation computes ratios from unwarped policy logprobs. "
+            "Use --temperature 1.0 --top_p 1.0 to keep rollout sampling and logprob accounting aligned."
+        )
+
+
+@contextmanager
+def policy_eval_forward(model):
+    was_training = model.training
+    model.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            model.train()
+
+
 def main():
     args = parse_args()
+    validate_args(args)
     os.makedirs(args.save_dir, exist_ok=True)
 
     device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,9 +152,12 @@ def main():
 
     reward_model, reward_tokenizer = None, None
     if args.reward_model_path != "default":
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        reward_model = AutoModelForCausalLM.from_pretrained(args.reward_model_path).to(device)
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        reward_model = AutoModelForSequenceClassification.from_pretrained(args.reward_model_path).to(device)
         reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path)
+        if reward_tokenizer.pad_token_id is None and reward_tokenizer.eos_token_id is not None:
+            reward_tokenizer.pad_token_id = reward_tokenizer.eos_token_id
         reward_model.eval().requires_grad_(False)
         log(f"Loaded reward model from {args.reward_model_path}")
 
@@ -153,25 +193,24 @@ def main():
     autocast_ctx, scaler = build_amp(args.dtype, device_type)
     rollout_engine = TorchRolloutEngine(policy_model, tokenizer, autocast_ctx=autocast_ctx)
 
-    steps_per_epoch = len(train_loader)
-    planned_steps = args.epochs * steps_per_epoch
-    total_steps = min(planned_steps, args.max_steps) if args.max_steps > 0 else planned_steps
+    rollout_steps_per_epoch = len(train_loader)
+    planned_rollout_steps = args.epochs * rollout_steps_per_epoch
+    total_rollout_steps = min(planned_rollout_steps, args.max_steps) if args.max_steps > 0 else planned_rollout_steps
+    total_steps = total_rollout_steps * args.num_iterations
     warmup_steps = int(total_steps * args.warmup_ratio)
 
     policy_model.train()
     optimizer.zero_grad(set_to_none=True)
     global_start = time.time()
+    rollout_step = 0
     global_step = 0
 
     for epoch in range(args.epochs):
         for batch_idx, batch in enumerate(train_loader):
-            if args.max_steps > 0 and global_step >= args.max_steps:
+            if args.max_steps > 0 and rollout_step >= args.max_steps:
                 break
 
-            global_step += 1
-            lr = get_lr(global_step, total_steps, args.learning_rate, warmup_steps, args.min_lr)
-            for group in optimizer.param_groups:
-                group["lr"] = lr
+            rollout_step += 1
 
             prompts = batch["prompt"]
             references = batch["reference"]
@@ -202,14 +241,6 @@ def main():
                 args.num_generations,
             )
 
-            with autocast_ctx():
-                per_token_logps = compute_per_token_logps(
-                    policy_model,
-                    output_ids,
-                    completion_ids.size(1),
-                    attention_mask=output_attention_mask,
-                )
-
             with torch.no_grad():
                 ref_per_token_logps = compute_per_token_logps(
                     ref_model,
@@ -224,67 +255,95 @@ def main():
                 references=references,
                 model=reward_model,
                 tokenizer=reward_tokenizer,
+                max_length=args.reward_max_len,
             ).to(device)
             advantages = group_normalize_rewards(rewards, args.num_generations)
-            grpo_loss, mean_kl = compute_grpo_loss(
-                per_token_logps=per_token_logps,
-                old_per_token_logps=old_per_token_logps,
-                ref_per_token_logps=ref_per_token_logps,
-                advantages=advantages,
-                completion_mask=completion_mask,
-                beta=args.beta,
-                epsilon=args.epsilon,
-            )
 
-            loss = grpo_loss / args.accumulation_steps
-            scaler.scale(loss).backward()
+            for grpo_iter in range(args.num_iterations):
+                global_step += 1
+                lr = get_lr(global_step, total_steps, args.learning_rate, warmup_steps, args.min_lr)
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
 
-            should_step = ((batch_idx + 1) % args.accumulation_steps == 0) or (
-                (batch_idx + 1) == len(train_loader)
-            )
-            if should_step:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy_model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                with policy_eval_forward(policy_model):
+                    with autocast_ctx():
+                        per_token_logps = compute_per_token_logps(
+                            policy_model,
+                            output_ids,
+                            completion_ids.size(1),
+                            attention_mask=output_attention_mask,
+                        )
 
-            if global_step % args.log_interval == 0 or global_step == total_steps:
-                remaining_time = get_remaining_time(
-                    global_step=global_step,
-                    total_steps=total_steps,
-                    start_step=0,
-                    start_time=global_start,
-                )
-                log_train_metrics(
-                    prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
-                    metrics={
-                        "loss": float(grpo_loss.detach().item()),
-                        "reward": float(rewards.mean().detach().item()),
-                        "reward_std": float(rewards.std(unbiased=False).detach().item()),
-                        "kl": float(mean_kl.detach().item()),
-                        "avg_len": float(completion_mask.sum(dim=1).mean().detach().item()),
-                    },
-                    lr=lr,
-                    eta_seconds=remaining_time,
+                grpo_loss, mean_kl = compute_grpo_loss(
+                    per_token_logps=per_token_logps,
+                    old_per_token_logps=old_per_token_logps,
+                    ref_per_token_logps=ref_per_token_logps,
+                    advantages=advantages,
+                    completion_mask=completion_mask,
+                    beta=args.beta,
+                    epsilon=args.epsilon,
                 )
 
-            if global_step % args.save_interval == 0 or global_step == total_steps:
-                save_model_only(args.save_dir, model=policy_model, name=args.save_name, dtype=policy_model.dtype)
-                save_checkpoint(
-                    args.save_dir,
-                    model=policy_model,
-                    name=args.save_name,
-                    optimizer=optimizer,
-                    step={"epoch": epoch, "epoch_step": batch_idx + 1},
-                    model_dtype=policy_model.dtype,
-                )
+                loss = grpo_loss / args.accumulation_steps
+                scaler.scale(loss).backward()
+
+                is_last_update = global_step == total_steps
+                should_step = (global_step % args.accumulation_steps == 0) or is_last_update
+                if should_step:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
+                if global_step % args.log_interval == 0 or is_last_update:
+                    remaining_time = get_remaining_time(
+                        global_step=global_step,
+                        total_steps=total_steps,
+                        start_step=0,
+                        start_time=global_start,
+                    )
+                    log_train_metrics(
+                        prefix=(
+                            f"epoch[{epoch + 1}/{args.epochs}]"
+                            f" rollout[{rollout_step}/{total_rollout_steps}]"
+                            f" update[{grpo_iter + 1}/{args.num_iterations}]"
+                            f"({global_step}/{total_steps})"
+                        ),
+                        metrics={
+                            "loss": float(grpo_loss.detach().item()),
+                            "reward": float(rewards.mean().detach().item()),
+                            "reward_std": float(rewards.std(unbiased=False).detach().item()),
+                            "kl": float(mean_kl.detach().item()),
+                            "avg_len": float(completion_mask.sum(dim=1).mean().detach().item()),
+                        },
+                        lr=lr,
+                        eta_seconds=remaining_time,
+                    )
+
+                if global_step % args.save_interval == 0 or is_last_update:
+                    save_model_only(args.save_dir, model=policy_model, name=args.save_name, dtype=policy_model.dtype)
+                    save_checkpoint(
+                        args.save_dir,
+                        model=policy_model,
+                        name=args.save_name,
+                        optimizer=optimizer,
+                        step={
+                            "epoch": epoch,
+                            "epoch_step": batch_idx + 1,
+                            "rollout_step": rollout_step,
+                            "global_step": global_step,
+                        },
+                        model_dtype=policy_model.dtype,
+                    )
+
+                del per_token_logps, grpo_loss, mean_kl, loss
 
             del output_ids, completion_ids, completion_mask, old_per_token_logps
-            del per_token_logps, ref_per_token_logps, rewards, advantages, grpo_loss, mean_kl, loss
+            del ref_per_token_logps, rewards, advantages
 
         log(f"Epoch {epoch + 1} complete.")
-        if args.max_steps > 0 and global_step >= args.max_steps:
+        if args.max_steps > 0 and rollout_step >= args.max_steps:
             break
 
     save_model_only(args.save_dir, model=policy_model, name=args.save_name, dtype=policy_model.dtype)
