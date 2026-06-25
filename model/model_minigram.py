@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from transformers import PretrainedConfig
 from typing import Optional
 import torch
@@ -57,6 +58,11 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch import nn
 import torch.nn.functional as F
+
+
+@dataclass
+class MiniGramCausalLMOutputWithPast(CausalLMOutputWithPast):
+    aux_loss: Optional[torch.FloatTensor] = None
 
 def _precompute_freqs_cis(dim, end, theta=100000.0, params:Optional[dict]=None):
     freqs, attn_factor = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)] / dim).float()), 1.0
@@ -399,26 +405,28 @@ class FFNofMoE(nn.Module):
         x_flat = x.view(-1, hidden_size)
         gate_probs = F.softmax(self.gate(x_flat), dim=-1)
         topk_probs, topk_indices = torch.topk(gate_probs, self.config.num_expert_per_token, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         expert_outputs = torch.zeros_like(x_flat)
-        for indices, expert in enumerate(self.experts):
-            mask = (topk_indices == indices).any(dim=-1)
-            if mask.any():
-                weight = topk_probs[mask].view(-1, 1)
-                expert_output = expert(x_flat[mask]).view(-1, 1) * weight
-                expert_outputs.index_add_(0, mask.any(dim=-1).nonzero().flatten(), expert_output)
+        for expert_idx, expert in enumerate(self.experts):
+            token_indices, topk_slots = torch.where(topk_indices == expert_idx)
+            if token_indices.numel() > 0:
+                weight = topk_probs[token_indices, topk_slots].unsqueeze(-1)
+                expert_output = expert(x_flat[token_indices]) * weight
+                expert_outputs.index_add_(0, token_indices, expert_output)
             elif self.training:
                 expert_outputs = expert_outputs + 0.0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.loss_coef > 0:
-            load = F.one_hot(topk_indices, self.config.num_experts).float().mean(0)
-            self.aux_loss = (load * gate_probs.mean(0)).sum() * self.config.num_experts * self.loss_coef
+            load = F.one_hot(topk_indices, self.config.num_experts).float().mean(dim=(0, 1))
+            aux_loss = (load * gate_probs.mean(0)).sum() * self.config.num_experts * self.loss_coef
         else:
-            self.aux_loss = torch.tensor(0.0, device=x.device)
-        return expert_outputs.view(batch_size, seq_length, hidden_size)
+            aux_loss = x.new_zeros(())
+        return expert_outputs.view(batch_size, seq_length, hidden_size), aux_loss
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: MiniGramConfig, layer_id: int = None):
         super().__init__()
         self.attention = SimpleAttention(config)
+        self.use_moe = config.use_moe
         self.ffn = FFN(config) if not config.use_moe else FFNofMoE(config)   
         self.norm1 = RMSNorm(config.hidden_size)
         self.norm2 = RMSNorm(config.hidden_size)
@@ -455,9 +463,13 @@ class TransformerBlock(nn.Module):
                 layer_cache["engram_conv"] = new_engram_conv
 
         residual = hidden_states
-        ffn_output = self.ffn(self.norm2(hidden_states))
+        if self.use_moe:
+            ffn_output, aux_loss = self.ffn(self.norm2(hidden_states))
+        else:
+            ffn_output = self.ffn(self.norm2(hidden_states))
+            aux_loss = hidden_states.new_zeros(())
         hidden_states = residual + ffn_output
-        return hidden_states, layer_cache
+        return hidden_states, layer_cache, aux_loss
 
 
 class MiniGramModel(nn.Module):
@@ -481,6 +493,7 @@ class MiniGramModel(nn.Module):
     def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None):
         hidden_states = self.token_embedding(input_ids)
         new_past_key_values = []
+        aux_loss = hidden_states.new_zeros(())
         seq_length = input_ids.size(1)
         past_key_values = _normalize_past_key_values(past_key_values)
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -491,7 +504,7 @@ class MiniGramModel(nn.Module):
         )
         for i, layer in enumerate(self.layers):
             past_key_value = past_key_values[i] if past_key_values is not None else None
-            hidden_states, new_past_key_value = layer(
+            hidden_states, new_past_key_value, layer_aux_loss = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
@@ -499,9 +512,10 @@ class MiniGramModel(nn.Module):
                 precompute_freqs=precompute_freqs,
                 input_ids=input_ids,
             )
+            aux_loss = aux_loss + layer_aux_loss
             new_past_key_values.append(new_past_key_value)
         hidden_states = self.norm(hidden_states)
-        return hidden_states, new_past_key_values
+        return hidden_states, new_past_key_values, aux_loss
 
 
 class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
@@ -519,7 +533,7 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values=None, labels=None, logits_to_keep=0, **kwargs):
         use_cache = self.use_cache if use_cache is None else use_cache
 
-        hidden_states, new_past_key_values = self.model(
+        hidden_states, new_past_key_values, aux_loss = self.model(
             input_ids, attention_mask, use_cache, past_key_values
         )
         logits_hidden_states = hidden_states
@@ -539,12 +553,12 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
                 ignore_index=-100,
             )
 
-        output = CausalLMOutputWithPast(
+        output = MiniGramCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=new_past_key_values,
+            aux_loss=aux_loss,
         )
-        setattr(output, "aux_loss", logits.new_zeros(()))
         return output
 
 
