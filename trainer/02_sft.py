@@ -18,6 +18,7 @@ from trainer.ddp_utils import (
     cleanup_distributed,
     get_model_dtype,
     init_distributed,
+    maybe_no_sync,
     rank0_log,
     reduce_metrics,
     set_sampler_epoch,
@@ -204,22 +205,23 @@ def main():
             input_ids = input_ids.to(device, non_blocking=pin_memory)
             labels = labels.to(device, non_blocking=pin_memory)
 
-            with autocast_ctx():
-                outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-                aux_loss = getattr(outputs, "aux_loss", None)
-                if aux_loss is None:
-                    aux_loss = outputs.loss.new_zeros(())
-                elif not torch.is_tensor(aux_loss):
-                    aux_loss = outputs.loss.new_tensor(float(aux_loss))
-                logits_loss = outputs.loss
-                total_loss = logits_loss + aux_loss
-
-            loss = total_loss / args.accumulation_steps
-            scaler.scale(loss).backward()
-
             should_step = ((batch_idx + 1) % args.accumulation_steps == 0) or (
                 (batch_idx + 1) == len(train_loader)
             )
+            with maybe_no_sync(model, ddp_state, should_step):
+                with autocast_ctx():
+                    outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
+                    aux_loss = getattr(outputs, "aux_loss", None)
+                    if aux_loss is None:
+                        aux_loss = outputs.loss.new_zeros(())
+                    elif not torch.is_tensor(aux_loss):
+                        aux_loss = outputs.loss.new_tensor(float(aux_loss))
+                    logits_loss = outputs.loss
+                    total_loss = logits_loss + aux_loss
+
+                loss = total_loss / args.accumulation_steps
+                scaler.scale(loss).backward()
+
             if should_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

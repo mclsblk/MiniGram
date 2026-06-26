@@ -1,5 +1,6 @@
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Optional
@@ -142,6 +143,12 @@ def wrap_ddp(
         ddp_kwargs["device_ids"] = [state.local_rank]
         ddp_kwargs["output_device"] = state.local_rank
     return DistributedDataParallel(model, **ddp_kwargs)
+
+
+def maybe_no_sync(model: torch.nn.Module, state: DistributedState, should_sync: bool):
+    if state.enabled and not should_sync and hasattr(model, "no_sync"):
+        return model.no_sync()
+    return nullcontext()
 
 
 def build_distributed_sampler(
