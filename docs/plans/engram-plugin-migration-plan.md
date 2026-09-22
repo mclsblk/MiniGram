@@ -30,6 +30,28 @@ model/
 
 不继续拆出 `hash.py`、`memory.py`、`kernel.py` 或单独的配置目录。Engram 的紧密相关实现集中在 `engram.py`，通道逻辑集中在 `channels.py`，以便学习和对照论文。
 
+### 2.1 精简实现约束
+
+本计划中的“插件”只表示模型包内部可替换的 PyTorch 组件，不建设通用插件系统。实现必须延续项目当前直接、紧凑的代码风格，并遵守以下约束：
+
+- 优先使用普通函数、`nn.Module` 和轻量 `dataclass`，不为每个插槽建立抽象基类或多层继承体系；只要调用签名一致，就不额外引入 `Protocol`、ABC 或 adapter 层。
+- 不引入动态注册表、插件发现、entry point、依赖注入、服务定位器、事件 hook 或生命周期框架。组件选择由一个集中 builder 使用简单映射或条件分支完成。
+- `EngramSpec`、`EngramState` 和 `ChannelState` 只保存当前三类预设实际需要的字段，不为未知的未来变体预留通用元数据、嵌套配置树或扩展上下文。
+- Engram 和 channel 各自最多保留一层构建函数；配置解析、合法性检查和模块实例化应集中完成，不拆成多级 factory。
+- 只实现本计划明确列出的组件与组合，不为尚未出现的第四种 Engram、第五种通道或外部第三方组件设计扩展框架。
+- 继续维持三个模型文件的边界，不因单个 mapper、hasher、readout 或 mixer 新增文件或目录。
+- 不新增或修改测试文件，不建立 golden fixture、组合测试矩阵或专用测试框架。必要验证复用现有检查，或使用不提交到仓库的一次性运行命令。
+
+以下规模作为代码评审触发线，而不是牺牲可读性的硬限制：
+
+| 范围 | 建议规模 |
+| --- | ---: |
+| `model/engram.py` | 约 450～700 行，包含迁入的 legacy 实现 |
+| `model/channels.py` | 约 250～400 行 |
+| `model_minigram.py` 新增集成逻辑 | 约 80～150 行 |
+
+若明显超过上述范围，应先检查是否出现了重复包装、过度泛化或可合并的构建层。只有具体算法公式、旧权重兼容或增量推理状态确实需要时才扩大实现。上述精简约束不得改变 legacy、Qwen、DeepSeek、single、GR4、mHC4 的核心计算逻辑，也不得删除全序列与增量推理共享实现、旧权重兼容或显式状态管理要求。
+
 ## 3. 总体组装方式
 
 模型配置使用两个正交选择项：
@@ -93,6 +115,8 @@ token_mapper  -> hasher -> memory_store -> readout -> postprocessor
 | `postprocessor` | `identity`、`causal_conv` |
 
 预设只负责生成完整 `EngramSpec`。`engram_overrides` 在构造模块之前修改 spec，因而 `forward` 不需要根据字符串选择算法。
+
+这里的插槽是统一调用约定，不要求五套抽象接口类。内置组件直接实现约定的输入输出，并由 `build_engram_layers()` 集中实例化。
 
 示例：
 
@@ -235,6 +259,8 @@ finalize(state) -> hidden
 
 `branch` 用于区分 attention、FFN 和必要的 Engram 插入点。具体类可以将 read/write 融合实现，但 Transformer 层看到的调用语义保持一致。
 
+统一生命周期只约束方法语义，不建立额外的 channel manager、hook 链或基类层次。三个通道类可以直接实现这些方法，共享的小段逻辑使用普通 helper 即可。
+
 ### 5.3 single
 
 `SingleResidualChannel` 是兼容基线：
@@ -288,7 +314,7 @@ residual_channels: int
 4. 验证组合是否合法；
 5. 一次性构造最终组件。
 
-验证器至少检查：
+集中 builder 在构造时直接检查：
 
 - n-gram 阶数非空且递增；
 - memory store 数量与 n-gram 阶数匹配；
@@ -306,6 +332,8 @@ self.engrams = build_engram_layers(config)
 ```
 
 具体组件选择不散落到 block 的 `forward` 中。
+
+两个 builder 均保持为普通集中函数，不再包装 registry、factory class 或配置解析对象。`engram_overrides` 只接受已知字段的浅层覆盖，不扩展为递归配置合并系统。
 
 ## 7. 推理状态与 cache
 
@@ -356,7 +384,7 @@ class EngramState:
 - prefill 后逐 token decode 的输出和 cache 结构；
 - 有无 Engram 时的模型参数量。
 
-这些结果作为重构期间的兼容基线。当前 shell 若没有 PyTorch，应先记录环境限制，并在项目已有训练环境中完成该步骤，不能用静态检查代替数值基线。
+这些结果作为重构期间的兼容基线。当前 shell 若没有 PyTorch，应先记录环境限制，并在项目已有训练环境中完成该步骤，不能用静态检查代替数值基线。基线通过现有脚本或一次性命令记录，不新增测试文件、fixture 或需要长期维护的基线框架。
 
 ### 阶段 1：原样抽取 legacy Engram
 
@@ -370,8 +398,8 @@ class EngramState:
 
 ### 阶段 2：引入统一 Engram 管线
 
-1. 定义 `EngramSpec`、五类组件协议和 builder。
-2. 用 adapter 把旧实现包装为 `legacy` 预设。
+1. 定义 `EngramSpec`、五类组件的统一调用约定和一个集中 builder，不增加协议类层次。
+2. 直接复用旧实现并接入 `legacy` 预设；必要的 shape 转换就地完成，不增加独立 adapter 类。
 3. 将 Engram 输出统一成 `[B, S, R, D]`。
 4. 引入 `EngramState`，同时保留旧 cache 的读取兼容。
 5. 再次验证 `legacy + single` 的数值等价性。
@@ -414,7 +442,11 @@ class EngramState:
 - Qwen Engram 搭配 single 或 mHC4；
 - DeepSeek Engram 搭配 single 或 GR4。
 
+这些组合直接通过配置构建和运行，不实现组合注册表、参数矩阵 runner 或额外的消融框架。
+
 ## 10. 验证计划与完成标准
+
+本节是实现完成后的行为验收清单，不要求为每一项编写自动化测试。实施期间不新增或修改 `tests/` 下的文件；可以运行现有测试，并用不提交到仓库的一次性命令完成必要的 forward、backward、prefill 和 decode 检查。
 
 ### 10.1 legacy 兼容
 
@@ -427,7 +459,7 @@ class EngramState:
 
 ### 10.2 三类 Engram
 
-- `legacy`、`qwen`、`deepseek` 均通过 shape、forward、backward 测试；
+- `legacy`、`qwen`、`deepseek` 均完成 shape、forward、backward 检查；
 - 每个 mapper/hasher/store/readout/postprocessor 可以独立实例化；
 - full-sequence hash 与 step decode hash 一致；
 - padding、BOS、短序列和最大 n-gram 边界正确；
@@ -459,9 +491,12 @@ class EngramState:
 本次迁移遵循以下约束：
 
 - 优先使用清晰的纯 PyTorch 实现；
+- 保持现有项目直写式代码风格，优先合并短小 wrapper，避免为了形式统一增加只做转发的类；
+- 插件化边界以“可替换且调用语义稳定”为准，不追求通用框架、第三方扩展能力或运行时动态装配；
 - 不为了论文参数规模牺牲本地可运行性；
 - 不在本阶段修改数据管线、训练循环、优化器或 GRPO 逻辑；
 - 不在本阶段加入自定义 CUDA/Triton kernel；
+- 不新增或修改测试代码，验证使用现有检查和临时运行命令；
 - 不将 Qwen 与 DeepSeek 的全部训练配方误归为 Engram 组件的一部分；
 - 每个迁移阶段独立提交并可回退，先保证 legacy 等价，再增加新机制。
 
@@ -475,15 +510,13 @@ class EngramState:
 
 ## 12. 推荐提交序列
 
-为降低破坏性修改风险，实际编码时建议按以下提交边界推进：
+为降低破坏性修改风险，同时避免把迁移拆成过多框架性步骤，实际编码时建议按以下提交边界推进：
 
-1. `test: capture legacy model and engram baselines`
-2. `refactor: move legacy engram implementation into module`
-3. `refactor: add pluggable engram pipeline and state`
-4. `refactor: route residual flow through single channel plugin`
-5. `feat: add qwen engram preset and gr4 channel`
-6. `feat: add deepseek engram preset and mhc4 channel`
-7. `test: cover engram overrides and cross-channel combinations`
-8. `docs: document engram presets and model assembly`
+1. `refactor: move legacy engram implementation into module`
+2. `refactor: add compact engram pipeline and state`
+3. `refactor: route residual flow through channel interface`
+4. `feat: add qwen engram preset and gr4 channel`
+5. `feat: add deepseek engram preset and mhc4 channel`
+6. `docs: document engram presets and model assembly`
 
-每个提交都应保持项目可导入，并运行该阶段已有的全部测试。若某阶段的数值兼容失败，应在进入下一阶段前解决，避免把结构迁移和新算法误差叠加在一起。
+阶段 0 的基线记录不单独形成测试提交，消融组合验证随对应功能提交完成，也不建立独立测试提交。每个提交都应保持项目可导入，并运行当时已有的检查。若某阶段的数值兼容失败，应在进入下一阶段前解决，避免把结构迁移和新算法误差叠加在一起。
