@@ -245,9 +245,9 @@ git rev-parse codex/legacy-v1 minigram-legacy-v1
 | `hash_seed` | legacy 默认 17；Qwen 默认参考值 1234；DeepSeek 为 `None`，按参考从层号派生 seed，不接受人为覆盖 |
 | `conv_kernel_size`、`conv_dilation` | legacy 默认 3／1；Qwen causal_conv 默认 4／最大 n-gram 阶数；identity 默认 1／1 且后续不会创建卷积 |
 
-旧字段 `engram_vocab_size`、`engram_n_gram_list`、`engram_num_heads`、`engram_conv_size`、`engram_hash_seed` 一律报错并给出 overrides 中的替代字段，不提供自动映射。布尔值不能冒充整数容量；未知组件、重复或乱序 n-gram、错误通道数等在构造配置时拒绝。
+旧字段 `engram_vocab_size`、`engram_n_gram_list`、`engram_num_heads`、`engram_conv_size`、`engram_hash_seed` 一律报错并给出 overrides 中的替代字段，不提供自动映射。参数类型遵循接口约定，不逐项检查 Python 精确类型；未知组件、重复或乱序 n-gram、错误通道数等仍在构造配置时拒绝。
 
-插入层使用零基索引，保存时排序；始终校验整数、非负和去重，启用 Engram 时检查层号上界。未启用时保留默认 `[1]`，不会因此阻止单层无 Engram 模型。legacy 预设、legacy readout 或 legacy convolution 启用时均仅用于 single。
+插入层使用零基索引，保存时排序；始终校验非负和去重，启用 Engram 时检查层号上界。未启用时保留默认 `[1]`，不会因此阻止单层无 Engram 模型。legacy 预设、legacy readout 或 legacy convolution 启用时均仅用于 single。
 
 ### 8.3 状态与 builder 契约
 
@@ -330,3 +330,17 @@ model = MiniGramForCausalLM(config)
 ### 9.4 交付状态
 
 本次为未经编码后审查和验证的 coding 交付。shape、梯度、full/decode、beam reorder、初始化、模型保存恢复及旧算法公式迁移的正确性均未在本阶段验证，不作已通过声明。后续验证范围继续使用第 5 节，不增加跨版本兼容验收。
+
+
+## 10. 配置与 cache 校验精简
+
+本次只清理阶段 1 和阶段 2／3 中重复或无实际作用的防御代码，不改变算法公式、五段管线或通道架构。
+
+- 有效 Engram 配置由 MiniGramConfig 统一解析和校验；builder 直接使用已解析字段构造 EngramSpec，不再次解析，也不重复检查 legacy 与 single 的组合。
+- 删除逐字段的 Python 精确类型检查，保留容量、阶数、插入层等算法取值约束。ngram_orders 仍要求非空、各阶至少为 2、严格递增且不重复，不通过排序去重静默修正输入。
+- GR rank 的正值约束只对 GR4 生效；卷积 kernel／dilation 的正值约束只对启用卷积的后处理生效。
+- cache 格式在模型入口校验，内部读取直接遵循新 cache 契约；删除 EngramLayer 的重复状态类型检查及内部 helper 的格式兜底。原 normalize helper 改名为 validate，明确其不负责转换。
+
+保留未知 overrides、废弃字段、不支持组合、cache 层数和 delta 精确形状等检查。residual_channels 的序列化及一致性约束保持现状，本次不扩展配置接口调整范围。
+
+按本次交付约定，清理完成后不执行编码后审查、AST 解析、git diff --check 或运行验证。这里只记录代码变更，不表示算法或运行验收通过；阶段 4 及后续阶段尚未开始。

@@ -20,7 +20,7 @@ from .common import RMSNorm
 
 @dataclass(frozen=True)
 class EngramSpec:
-    ngram_orders: tuple[int, ...]
+    ngram_orders: tuple[int, ...] | list[int]
     token_mapper: str
     hasher: str
     memory_store: str
@@ -54,12 +54,10 @@ def resolve_engram_spec(variant, overrides, hidden_size):
                          memory_store="packed", readout="deepseek_signed_sqrt",
                          postprocessor="identity", insertion="before_attention"),
     }
-    if not isinstance(variant, str) or variant not in presets:
+    if variant not in presets:
         raise ValueError(f"Unknown engram_variant: {variant!r}")
     if overrides is None:
         overrides = {}
-    if not isinstance(overrides, dict):
-        raise ValueError("engram_overrides must be a shallow dictionary")
     unknown = set(overrides) - {field.name for field in fields(EngramSpec)}
     if unknown:
         raise ValueError(f"Unknown engram_overrides fields: {sorted(map(str, unknown))}")
@@ -76,25 +74,23 @@ def resolve_engram_spec(variant, overrides, hidden_size):
         if values[name] not in supported:
             raise ValueError(f"engram_overrides.{name} must be one of {supported}")
     orders = values["ngram_orders"]
-    if (not isinstance(orders, (list, tuple)) or not orders
-            or any(type(order) is not int or order < 2 for order in orders)
-            or list(orders) != sorted(set(orders))):
+    if not orders or any(order < 2 for order in orders) or list(orders) != sorted(set(orders)):
         raise ValueError("engram_overrides.ngram_orders must be nonempty, strictly increasing integers >= 2")
     values["ngram_orders"] = tuple(orders)
-    for name in ("bucket_size", "num_heads"):
-        if type(values[name]) is not int or values[name] <= 0:
-            raise ValueError(f"engram_overrides.{name} must be a positive integer")
     if values["bucket_size"] < 2:
         raise ValueError("engram_overrides.bucket_size must be at least 2")
-    if type(hidden_size) is not int or hidden_size <= 0:
-        raise ValueError("hidden_size must be a positive integer")
+    if values["num_heads"] <= 0:
+        raise ValueError("engram_overrides.num_heads must be positive")
     values.setdefault("head_dim", math.ceil(hidden_size / (len(orders) * values["num_heads"])))
+    if values["head_dim"] <= 0:
+        raise ValueError("engram_overrides.head_dim must be positive")
     processor = values["postprocessor"]
     values.setdefault("conv_kernel_size", {"identity": 1, "legacy_conv": 3, "causal_conv": 4}[processor])
     values.setdefault("conv_dilation", max(orders) if processor == "causal_conv" else 1)
-    for name in ("head_dim", "conv_kernel_size", "conv_dilation"):
-        if type(values[name]) is not int or values[name] <= 0:
-            raise ValueError(f"engram_overrides.{name} must be a positive integer")
+    if processor != "identity":
+        for name in ("conv_kernel_size", "conv_dilation"):
+            if values[name] <= 0:
+                raise ValueError(f"engram_overrides.{name} must be positive for {processor}")
     if processor == "legacy_conv" and values["conv_dilation"] != 1:
         raise ValueError("legacy_conv requires conv_dilation=1; use causal_conv for dilation")
     hasher = values["hasher"]
@@ -102,8 +98,8 @@ def resolve_engram_spec(variant, overrides, hidden_size):
     if hasher == "deepseek_xor":
         if values["hash_seed"] is not None:
             raise ValueError("deepseek_xor derives seeds from layer IDs; hash_seed must be None")
-    elif type(values["hash_seed"]) is not int or values["hash_seed"] < 0:
-        raise ValueError(f"{hasher} requires a nonnegative integer hash_seed")
+    elif values["hash_seed"] < 0:
+        raise ValueError(f"{hasher} requires a nonnegative hash_seed")
     return EngramSpec(**values)
 
 
@@ -277,8 +273,6 @@ class EngramLayer(nn.Module):
         self.postprocessor = postprocessor
 
     def forward(self, input_ids, streams, state=None, token_mask=None):
-        if state is not None and not isinstance(state, EngramState):
-            raise TypeError("Engram cache must be an EngramState")
         state = EngramState() if state is None else state
         mapped = self.token_mapper(input_ids)
         bucket_ids, hash_tail = self.hasher(mapped, state.hash_tail, token_mask)
@@ -305,9 +299,8 @@ def build_engram_layers(config) -> nn.ModuleDict:
         return nn.ModuleDict()
     if config.engram_variant != "legacy":
         raise NotImplementedError(f"Engram preset {config.engram_variant!r} arrives in stages 6/7")
-    if config.residual_channels != 1:
-        raise ValueError("legacy Engram requires single residual channel")
-    spec = resolve_engram_spec(config.engram_variant, config.engram_overrides, config.hidden_size)
+    # MiniGramConfig already resolved defaults and validated the combination.
+    spec = EngramSpec(**config.engram_overrides)
     supported = {"token_mapper": ("identity",), "hasher": ("legacy",),
                  "readout": ("legacy",), "postprocessor": ("identity", "legacy_conv")}
     for name, choices in supported.items():

@@ -31,24 +31,20 @@ class MiniGramConfig(PretrainedConfig):
             replacements = ", ".join(f"{name} -> {deprecated[name]}" for name in supplied)
             raise ValueError(f"Removed Engram configuration fields; use engram_overrides instead: {replacements}")
         for name, value in (("hidden_size", hidden_size), ("num_hidden_layers", num_hidden_layers)):
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if type(use_engrams) is not bool:
-            raise ValueError("use_engrams must be a boolean")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
         channel_counts = {"single": 1, "gr4": 4, "mhc4": 4}
-        if not isinstance(residual_variant, str) or residual_variant not in channel_counts:
+        if residual_variant not in channel_counts:
             raise ValueError(f"Unknown residual_variant: {residual_variant!r}")
         channels = channel_counts[residual_variant]
         supplied_channels = kwargs.pop("residual_channels", channels)
-        if type(supplied_channels) is not int or supplied_channels != channels:
+        if supplied_channels != channels:
             raise ValueError(f"residual_variant={residual_variant!r} requires residual_channels={channels}")
         rank = min(64, hidden_size) if residual_low_rank is None else residual_low_rank
-        if type(rank) is not int or rank <= 0:
-            raise ValueError("residual_low_rank must be a positive integer")
+        if residual_variant == "gr4" and rank <= 0:
+            raise ValueError("residual_low_rank must be positive for gr4")
         layers = [1] if engram_n_layer_list is None else engram_n_layer_list
-        if (not isinstance(layers, (list, tuple))
-                or any(type(layer) is not int or layer < 0 for layer in layers)
-                or len(set(layers)) != len(layers)):
+        if any(layer < 0 for layer in layers) or len(set(layers)) != len(layers):
             raise ValueError("engram_n_layer_list must contain distinct nonnegative integer layer indices")
         if use_engrams and any(layer >= num_hidden_layers for layer in layers):
             raise ValueError("engram_n_layer_list contains an index outside num_hidden_layers")
@@ -154,24 +150,15 @@ def repeat_kv(tensor, num_kv_heads, num_attention_heads):
     return tensor.unsqueeze(3).repeat_interleave(repeat_factor, dim=3).reshape(b, s, num_attention_heads, d)
 
 def _get_from_cache(past_key_value, key):
-    if past_key_value is None:
-        return None
-    if isinstance(past_key_value, dict):
-        return past_key_value.get(key)
-    return None
+    return None if past_key_value is None else past_key_value.get(key)
 
 def _get_past_length(past_key_value):
     if past_key_value is None:
         return 0
-    if isinstance(past_key_value, dict) and "attn" in past_key_value:
-        attn_cache = past_key_value["attn"]
-        if attn_cache is not None and isinstance(attn_cache, tuple) and len(attn_cache) == 2:
-            k_cache = attn_cache[0]
-            if k_cache is not None and k_cache.dim() >= 2:
-                return k_cache.size(1)
-    return 0
+    attn_cache = past_key_value["attn"]
+    return 0 if attn_cache is None else attn_cache[0].size(1)
 
-def _normalize_past_key_values(past_key_values):
+def _validate_past_key_values(past_key_values):
     if past_key_values is None:
         return None
     if not isinstance(past_key_values, (list, tuple)):
@@ -384,7 +371,7 @@ class MiniGramModel(nn.Module):
         new_past_key_values = [] if use_cache else None
         aux_loss = hidden_states.new_zeros(())
         seq_length = input_ids.size(1)
-        past_key_values = _normalize_past_key_values(past_key_values)
+        past_key_values = _validate_past_key_values(past_key_values)
         if past_key_values is not None:
             if not use_cache:
                 raise ValueError("Supplying past_key_values requires use_cache=True")
@@ -457,7 +444,7 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
 
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        caches = _normalize_past_key_values(past_key_values)
+        caches = _validate_past_key_values(past_key_values)
         if caches is None:
             return None
         reordered = []
