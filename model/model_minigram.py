@@ -5,8 +5,7 @@ import torch
 import math
 
 from .channels import build_residual_channel
-from .common import RMSNorm
-from .engram import build_engram_layers, resolve_engram_spec
+from .engram import EngramState, build_engram_layers, resolve_engram_spec
 
 
 class MiniGramConfig(PretrainedConfig):
@@ -175,17 +174,16 @@ def _get_past_length(past_key_value):
 def _normalize_past_key_values(past_key_values):
     if past_key_values is None:
         return None
-
-    to_legacy = getattr(past_key_values, "to_legacy_cache", None)
-    if callable(to_legacy):
-        legacy_cache = to_legacy()
-        if legacy_cache is not None:
-            return legacy_cache
-
-    layers = getattr(past_key_values, "layers", None)
-    if layers is not None:
-        return layers
-
+    if not isinstance(past_key_values, (list, tuple)):
+        raise TypeError("past_key_values must be a sequence of layer dictionaries")
+    for cache in past_key_values:
+        if not isinstance(cache, dict) or set(cache) - {"attn", "engram"}:
+            raise ValueError("Layer cache accepts only 'attn' and 'engram'; old cache formats are unsupported")
+        if cache.get("engram") is not None and not isinstance(cache["engram"], EngramState):
+            raise TypeError("The 'engram' cache entry must be an EngramState")
+        attn = cache.get("attn")
+        if attn is not None and (not isinstance(attn, tuple) or len(attn) != 2):
+            raise TypeError("The 'attn' cache entry must be a (key, value) tuple")
     return past_key_values
 
 
@@ -266,150 +264,6 @@ class SimpleAttention(nn.Module):
         return output, past_key_value
 
 
-class EngramModule(nn.Module):
-    # Historical formula source, unreachable through MiniGramModel in stage 1.
-    # Stage 3 replaces this class with the new pipeline; this is not an old API shim.
-    def __init__(self, config: MiniGramConfig, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        self.n_gram_list = config.engram_n_gram_list
-        self.num_heads = config.engram_num_heads
-        self.engram_vocab_size = config.engram_vocab_size
-        self.hidden_size = config.hidden_size
-        self.hash_seed = config.engram_hash_seed
-        self.conv_kernel_size = config.engram_conv_size
-        self.total_memory_heads = len(self.n_gram_list) * self.num_heads
-        self.head_dim = max(1, math.ceil(self.hidden_size / self.total_memory_heads))
-        self.memory_dim = self.head_dim * self.total_memory_heads
-        self.hash_modulus = self.engram_vocab_size - 1
-        self.token_tail_size = max(self.n_gram_list) - 1
-        self.conv_tail_size = self.conv_kernel_size - 1
-
-        self.head_slices = {}
-        head_offset = 0
-        for n in self.n_gram_list:
-            self.head_slices[n] = slice(head_offset, head_offset + self.num_heads)
-            head_offset += self.num_heads
-
-        self.hash_multiplier_names = {}
-        self.hash_offset_names = {}
-        for n in self.n_gram_list:
-            multipliers, offsets = self._build_hash_parameters(n)
-            multiplier_name = f"hash_multipliers_{n}"
-            offset_name = f"hash_offsets_{n}"
-            self.register_buffer(multiplier_name, multipliers, persistent=False)
-            self.register_buffer(offset_name, offsets, persistent=False)
-            self.hash_multiplier_names[n] = multiplier_name
-            self.hash_offset_names[n] = offset_name
-
-        self.embeddings = nn.ModuleList(
-            [nn.Embedding(self.engram_vocab_size, self.head_dim, padding_idx=0) for _ in range(self.total_memory_heads)]
-        )
-        self.memory_key_proj = nn.Linear(self.memory_dim, self.hidden_size, bias=False)
-        self.memory_value_proj = nn.Linear(self.memory_dim, self.hidden_size, bias=False)
-        self.memory_key_norm = RMSNorm(self.hidden_size)
-        self.memory_value_norm = RMSNorm(self.hidden_size)
-        self.memory_conv = nn.Conv1d(
-            in_channels=self.hidden_size,
-            out_channels=self.hidden_size,
-            kernel_size=self.conv_kernel_size,
-            groups=self.hidden_size,
-            bias=False,
-        )
-        self.memory_gate_bias = nn.Parameter(torch.tensor(-4.0))
-        nn.init.zeros_(self.memory_conv.weight)
-
-    def _build_hash_parameters(self, n: int):
-        multipliers = []
-        offsets = []
-        max_int = (1 << 31) - 1
-        for head_idx in range(self.num_heads):
-            base_seed = (
-                self.hash_seed
-                + 10007 * (self.layer_id + 1)
-                + 1543 * (n + 1)
-                + 8191 * (head_idx + 1)
-            )
-            head_multipliers = []
-            for pos in range(n):
-                value = (base_seed + 32771 * (pos + 1) + 65537 * (head_idx + 1) * (pos + 1)) % max_int
-                head_multipliers.append(value * 2 + 1)
-            offset = (base_seed * 48271 + 97 * (n + head_idx + 1)) % max_int
-            multipliers.append(head_multipliers)
-            offsets.append(offset)
-        return torch.tensor(multipliers, dtype=torch.long), torch.tensor(offsets, dtype=torch.long)
-
-    def compute_hash_ids(self, input_ids, tail_tokens=None):
-        batch_size, seq_len = input_ids.shape
-        if tail_tokens is None:
-            tail_tokens = input_ids.new_zeros(batch_size, 0)
-        else:
-            tail_tokens = tail_tokens.to(device=input_ids.device, dtype=input_ids.dtype)
-
-        if seq_len == 0:
-            empty_hashes = input_ids.new_zeros(batch_size, 0, self.total_memory_heads)
-            new_tail = tail_tokens[:, -self.token_tail_size:] if self.token_tail_size > 0 else input_ids.new_zeros(batch_size, 0)
-            return empty_hashes, new_tail
-
-        context = torch.cat([tail_tokens, input_ids], dim=1)
-        prefix_len = tail_tokens.size(1)
-        hash_ids = input_ids.new_zeros(batch_size, seq_len, self.total_memory_heads)
-
-        if self.hash_modulus <= 0:
-            new_tail = context[:, -self.token_tail_size:] if self.token_tail_size > 0 else input_ids.new_zeros(batch_size, 0)
-            return hash_ids, new_tail
-
-        for n in self.n_gram_list:
-            full_hash = input_ids.new_zeros(batch_size, context.size(1), self.num_heads)
-            if context.size(1) >= n:
-                windows = context.unfold(dimension=1, size=n, step=1).to(torch.long)
-                multipliers = getattr(self, self.hash_multiplier_names[n]).to(device=input_ids.device)
-                offsets = getattr(self, self.hash_offset_names[n]).to(device=input_ids.device)
-                mix = windows[:, :, 0].unsqueeze(-1) * multipliers[:, 0].view(1, 1, -1)
-                for pos in range(1, n):
-                    current = windows[:, :, pos].unsqueeze(-1) * multipliers[:, pos].view(1, 1, -1)
-                    mix = torch.bitwise_xor(mix, current)
-                full_hash[:, n - 1:, :] = torch.remainder(mix + offsets.view(1, 1, -1), self.hash_modulus) + 1
-            hash_ids[:, :, self.head_slices[n]] = full_hash[:, prefix_len:prefix_len + seq_len, :]
-
-        if self.token_tail_size > 0:
-            new_tail = context[:, -self.token_tail_size:]
-        else:
-            new_tail = input_ids.new_zeros(batch_size, 0)
-        return hash_ids, new_tail
-
-    def retrieve_memory(self, hash_ids):
-        head_embeddings = [embedding(hash_ids[:, :, head_idx]) for head_idx, embedding in enumerate(self.embeddings)]
-        return torch.cat(head_embeddings, dim=-1)
-
-    def apply_memory_conv(self, memory_value, conv_state=None):
-        batch_size, seq_len, _ = memory_value.shape
-        if conv_state is None:
-            conv_state = memory_value.new_zeros(batch_size, 0, self.hidden_size)
-        else:
-            conv_state = conv_state.to(device=memory_value.device, dtype=memory_value.dtype)
-
-        conv_source = torch.cat([conv_state, memory_value], dim=1)
-        conv_full = self.memory_conv(F.pad(conv_source.transpose(1, 2), (self.conv_tail_size, 0))).transpose(1, 2)
-        conv_current = conv_full[:, -seq_len:, :]
-        if self.conv_tail_size > 0:
-            new_conv_state = conv_source[:, -self.conv_tail_size:, :]
-        else:
-            new_conv_state = memory_value.new_zeros(batch_size, 0, self.hidden_size)
-        return conv_current, new_conv_state
-
-    def forward(self, hidden_states, input_ids, tail_tokens=None, conv_state=None):
-        hash_ids, new_tail = self.compute_hash_ids(input_ids, tail_tokens=tail_tokens)
-        memory = self.retrieve_memory(hash_ids)
-        memory_key = self.memory_key_norm(self.memory_key_proj(memory))
-        memory_value = self.memory_value_norm(self.memory_value_proj(memory))
-        gate_logits = (hidden_states * memory_key).sum(dim=-1) / math.sqrt(self.hidden_size)
-        gate_logits = gate_logits + self.memory_gate_bias
-        gate = torch.sigmoid(gate_logits).unsqueeze(-1)
-        gated_memory = gate * memory_value
-        conv_out, new_conv_state = self.apply_memory_conv(gated_memory, conv_state=conv_state)
-        return gated_memory + conv_out, new_tail, new_conv_state
-
 # ############################################################################ #
 # FFN and FFNofMoE are same implementation from minimind                       #
 # ############################################################################ #
@@ -462,69 +316,59 @@ class FFNofMoE(nn.Module):
         return expert_outputs.view(batch_size, seq_length, hidden_size), aux_loss
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: MiniGramConfig, layer_id: int = None):
+    def __init__(self, config: MiniGramConfig, layer_id: int):
         super().__init__()
+        self.layer_id = layer_id
         self.attention = SimpleAttention(config)
         self.use_moe = config.use_moe
-        self.ffn = FFN(config) if not config.use_moe else FFNofMoE(config)   
-        self.norm1 = RMSNorm(config.hidden_size)
-        self.norm2 = RMSNorm(config.hidden_size)
-        if config.use_engrams and (layer_id is not None) and (layer_id in config.engram_n_layer_list):
-            self.layer_id = layer_id
-            self.engram = EngramModule(config, layer_id=layer_id)
-            self.norm_engram = RMSNorm(config.hidden_size)
-        else:
-            self.engram = None
-    
-    def forward(self, hidden_states, attention_mask=None, use_cache=False, 
+        self.ffn = FFN(config) if not config.use_moe else FFNofMoE(config)
+
+    def forward(self, state, channel, engram=None, attention_mask=None, use_cache=False,
                 past_key_value=None, precompute_freqs=None, input_ids=None):
-        residual = hidden_states
-        attn_output, new_past_key_value = self.attention(
-            self.norm1(hidden_states),
-            precompute_freqs,
-            attention_mask,
-            use_cache,
+        engram_state = _get_from_cache(past_key_value, "engram")
+        token_mask = None
+        if attention_mask is not None and attention_mask.dim() == 2:
+            token_mask = attention_mask[:, -input_ids.size(1):]
+        if engram is not None and engram.before_attention:
+            delta, engram_state = engram(input_ids, state.streams, engram_state, token_mask)
+            state = channel.inject(state, delta)
+
+        hidden, context = channel.read(state, (self.layer_id, "attention"))
+        attn_output, attn_cache = self.attention(
+            hidden, precompute_freqs, attention_mask, use_cache,
             _get_from_cache(past_key_value, "attn"),
         )
-        hidden_states = residual + attn_output
-        layer_cache = {"attn": new_past_key_value} if use_cache else None
-        
-        if self.engram is not None:
-            engram_output, new_engram_tail, new_engram_conv = self.engram(
-            self.norm_engram(hidden_states),
-            input_ids,
-            tail_tokens=_get_from_cache(past_key_value, "engram_tail"),
-            conv_state=_get_from_cache(past_key_value, "engram_conv")
-            )
-            hidden_states = hidden_states + engram_output
-            if use_cache:
-                layer_cache["engram_tail"] = new_engram_tail
-                layer_cache["engram_conv"] = new_engram_conv
+        state = channel.write(state, attn_output, context)
 
-        residual = hidden_states
+        if engram is not None and not engram.before_attention:
+            delta, engram_state = engram(input_ids, state.streams, engram_state, token_mask)
+            state = channel.inject(state, delta)
+
+        hidden, context = channel.read(state, (self.layer_id, "ffn"))
         if self.use_moe:
-            ffn_output, aux_loss = self.ffn(self.norm2(hidden_states))
+            ffn_output, aux_loss = self.ffn(hidden)
         else:
-            ffn_output = self.ffn(self.norm2(hidden_states))
-            aux_loss = hidden_states.new_zeros(())
-        hidden_states = residual + ffn_output
-        return hidden_states, layer_cache, aux_loss
+            ffn_output = self.ffn(hidden)
+            aux_loss = hidden.new_zeros(())
+        state = channel.write(state, ffn_output, context)
+        layer_cache = None
+        if use_cache:
+            layer_cache = {"attn": attn_cache}
+            if engram is not None:
+                layer_cache["engram"] = engram_state
+        return state, layer_cache, aux_loss
 
 
 class MiniGramModel(nn.Module):
     def __init__(self, config: MiniGramConfig):
         super().__init__()
         self.config = config
-        # Stage 2 replaces the direct single-stream flow with the channel API.
-        # Until then, fail explicitly rather than running a requested GR/mHC as single.
-        if config.residual_variant != "single":
-            build_residual_channel(config)
+        self.channel = build_residual_channel(config)
         self.engrams = build_engram_layers(config)
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
             self.layers.append(TransformerBlock(config, layer_id=i))
-        self.norm = RMSNorm(config.hidden_size)
         _, cos, sin = _precompute_freqs_cis(
             config.hidden_size // config.num_attention_heads,
             config.max_length, 
@@ -536,11 +380,16 @@ class MiniGramModel(nn.Module):
     
     def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None):
         hidden_states = self.token_embedding(input_ids)
-        new_past_key_values = []
+        state = self.channel.initialize(hidden_states)
+        new_past_key_values = [] if use_cache else None
         aux_loss = hidden_states.new_zeros(())
         seq_length = input_ids.size(1)
         past_key_values = _normalize_past_key_values(past_key_values)
-        past_key_values = past_key_values or [None] * len(self.layers)
+        if past_key_values is not None:
+            if not use_cache:
+                raise ValueError("Supplying past_key_values requires use_cache=True")
+            if len(past_key_values) != len(self.layers):
+                raise ValueError("past_key_values must contain one cache per layer")
         past_length = _get_past_length(past_key_values[0]) if past_key_values else 0
         precompute_freqs = (
             self.precompute_freqs_cos[past_length:past_length + seq_length],
@@ -548,18 +397,17 @@ class MiniGramModel(nn.Module):
         )
         for i, layer in enumerate(self.layers):
             past_key_value = past_key_values[i] if past_key_values is not None else None
-            hidden_states, new_past_key_value, layer_aux_loss = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                use_cache=use_cache,
-                past_key_value=past_key_value,
-                precompute_freqs=precompute_freqs,
+            engram = self.engrams[str(i)] if str(i) in self.engrams else None
+            state, new_past_key_value, layer_aux_loss = layer(
+                state, channel=self.channel, engram=engram,
+                attention_mask=attention_mask, use_cache=use_cache,
+                past_key_value=past_key_value, precompute_freqs=precompute_freqs,
                 input_ids=input_ids,
             )
             aux_loss = aux_loss + layer_aux_loss
-            new_past_key_values.append(new_past_key_value)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states, new_past_key_values, aux_loss
+            if use_cache:
+                new_past_key_values.append(new_past_key_value)
+        return self.channel.finalize(state), new_past_key_values, aux_loss
 
 
 class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
@@ -572,6 +420,8 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         self.model.token_embedding.weight = self.lm_head.weight
         self.use_cache = config.use_cache
         self.post_init()
+        for engram in self.model.engrams.values():
+            engram.reset_special_parameters()
     
     def forward(self, input_ids=None, attention_mask=None, use_cache=None,
                 past_key_values=None, labels=None, logits_to_keep=0, **kwargs):
@@ -607,29 +457,19 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
 
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        if past_key_values is None:
-            return past_key_values
-
+        caches = _normalize_past_key_values(past_key_values)
+        if caches is None:
+            return None
         reordered = []
-        for layer_cache in past_key_values:
-            if layer_cache is None:
-                reordered.append(None)
-                continue
-
-            if isinstance(layer_cache, dict):
-                reordered_layer_cache = {}
-                for key, value in layer_cache.items():
-                    if value is None:
-                        reordered_layer_cache[key] = None
-                    elif isinstance(value, tuple):
-                        reordered_layer_cache[key] = tuple(
-                            tensor.index_select(0, beam_idx.to(tensor.device)) for tensor in value
-                        )
-                    else:
-                        reordered_layer_cache[key] = value.index_select(0, beam_idx.to(value.device))
-                reordered.append(reordered_layer_cache)
-            else:
-                reordered.append(
-                    tuple(tensor.index_select(0, beam_idx.to(tensor.device)) for tensor in layer_cache)
+        for cache in caches:
+            attn = cache.get("attn")
+            layer_cache = {
+                "attn": None if attn is None else tuple(
+                    value.index_select(0, beam_idx.to(value.device)) for value in attn
                 )
+            }
+            if "engram" in cache:
+                state = cache["engram"]
+                layer_cache["engram"] = None if state is None else state.reorder(beam_idx)
+            reordered.append(layer_cache)
         return reordered

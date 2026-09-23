@@ -213,10 +213,11 @@ git rev-parse codex/legacy-v1 minigram-legacy-v1
 
 - **阶段 0 已落实**：建立本地冻结分支与 tag；以方案 B 替换旧计划；记录新接口、支持范围、参考指纹与静态检查命令。阶段 0 未修改模型实现。
 - **阶段 1 已落实**：新增公共 norm、解析后的 EngramSpec、新配置校验、显式状态和集中 builder 入口；算法构建尚未开放，详见第 8 节。配置序列化往返和状态重排仅完成实现及静态审查，未运行验证。
-- **阶段 2～8 未开始**：需用户明确确认下一阶段后继续；每阶段完成后更新本节。
+- **阶段 2／3 已合并编码交付**：按用户要求合并为一次本地提交；接入 single 通道、legacy 五段管线和新 cache。用户明确要求 coding 后不审查，因此本次未执行代码审查、AST 检查、diff 检查或运行验证。
+- **阶段 4～8 未开始**：需用户明确确认下一阶段后继续；每阶段完成后更新本节。
 - **运行验证全部待执行**：当前没有算法、数值、梯度、保存恢复或增量推理通过的结论。
 
-## 8. 阶段 1：已落地的接口与中间版本限制
+## 8. 阶段 1：接口记录与当时的中间版本限制
 
 ### 8.1 公共组件与依赖
 
@@ -256,7 +257,9 @@ git rev-parse codex/legacy-v1 minigram-legacy-v1
 - 通道 `branch` 标识为 `(layer_index, "attention" 或 "ffn")`，因此集中通道模块能够持有各层各分支独立参数，而不是全模型共享一份映射。
 - `build_engram_layers(config)` 的返回类型为按层号字符串索引的 `nn.ModuleDict`；禁用 Engram 时返回空模块集合。`build_residual_channel(config)` 是唯一通道模块构建入口。具体算法在后续阶段接入这些入口。
 
-### 8.4 当前可达路径与待运行验证
+### 8.4 阶段 1 当时的可达路径与待运行验证
+
+本小节记录阶段 1 的历史状态；阶段 2／3 后的可用范围以第 9 节为准。
 
 本阶段保留主模型原有的 **关闭 Engram＋single** 直连路径，尚未改成通道 API。构造配置与实例化算法是两件事：配置可以描述所有目标预设，但本阶段尝试在模型中启用任何 Engram、GR4 或 mHC4 都会显式抛出 `NotImplementedError`，并提示对应实施阶段，不会静默退化。
 
@@ -269,3 +272,61 @@ git rev-parse codex/legacy-v1 minigram-legacy-v1
 - `EngramState.reorder()` 对重复 beam 索引和设备位置的行为。
 - 公共 norm 的 dtype、分组、参数初始化和数值行为。
 - 后续阶段接入后，无 Engram 主模型、五段管线和通道生命周期的运行行为。
+
+
+## 9. 阶段 2／3：合并编码交付
+
+用户授权合并阶段 2／3，并要求 coding 后不进行审查。本次仅修改 `model/channels.py`、`model/engram.py`、`model/model_minigram.py` 和本文档；未修改公共组件、训练脚本、推理脚本、工具、依赖或测试文件。第 4 节原定的阶段后检查在本次交付中不执行，不表示这些检查通过。
+
+### 9.1 已接入的模型路径
+
+- `SingleResidualChannel` 实现 initialize、read、write、inject、finalize。原 attention／FFN 前的 RMSNorm 按层、按分支归属到通道中，末端 RMSNorm 归属到 finalize；没有新增残差映射参数。
+- 主模型只在顶层注册 channel 和 Engram ModuleDict，调用 block 时传递引用；block 不重复注册这些模块。四维 ChannelState 沿层传播，attention 和 FFN 接收通道读出的三维 hidden。
+- 删除主文件中的旧 `EngramModule` 和旧 Engram 连接代码。legacy 的 query norm 归属 readout；插入前后通过构造时解析的布尔标记选择，block 不包含具体记忆算法。
+- 每个 legacy 层依次执行 IdentityTokenMapper、LegacyHasher、MemoryStore、LegacyReadout、PostProcessor，返回 delta 和新 EngramState。
+- 存储支持 separate／packed，均按阶数再按 head 排列。legacy 保留各 head 的零号 padding bucket；packed 在每 head 对应位置保留零行，并通过输出 mask 阻断这些行的梯度。
+- 后处理支持 legacy_conv 和 identity；identity 不创建卷积参数，返回的 post_state 为 None。legacy 卷积的历史为 `[B,T,1,D]`，长度由 kernel 推导。
+- legacy 继续按原 token IDs 计算哈希，EOS／padding 不被重新解释为分段标记；attention mask 不改变 legacy 哈希和卷积公式。后续 Qwen／DeepSeek 的边界机制不在本阶段实现。
+- 顶层 post_init 后恢复 legacy 的零卷积初始化及表中 padding 零行；没有权重名称迁移或旧接口 wrapper。
+
+### 9.2 新 cache 约定
+
+`past_key_values` 为逐层字典序列，每层只接受 `attn` 和可选 `engram`：
+
+- `attn` 为 `(key, value)` tuple。
+- `engram` 为 EngramState，包含有限 hash_tail 与可选卷积历史。
+- 拒绝旧 cache key 和非约定的外部 cache 容器，不自动转换。
+- 有历史输入时要求 `use_cache=True`，层数必须与模型一致；关闭 cache 时模型返回 `past_key_values=None`。
+- beam 重排分别处理 attention tensor 和 EngramState，不保存或重排跨 forward 的 ChannelState。
+
+### 9.3 当前配置示例
+
+以下为已编码接口的用法说明，**未执行验证**：
+
+```python
+from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
+
+config = MiniGramConfig(
+    hidden_size=32,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_kv_heads=2,
+    intermediate_size=64,
+    vocab_size=64,
+    max_length=32,
+    dropout=0.0,
+    flash_attention=False,
+    use_engrams=True,
+    engram_variant="legacy",
+    residual_variant="single",
+    engram_n_layer_list=[1],
+    engram_overrides={"bucket_size": 17},
+)
+model = MiniGramForCausalLM(config)
+```
+
+通过 `engram_overrides={"memory_store": "packed", "postprocessor": "identity"}` 可以选择 packed 表和无卷积 legacy 变体。关闭 Engram 时返回空记忆模块集合；GR4／mHC4 和 Qwen／DeepSeek 仍明确报未实现。默认 Engram 预设仍为 DeepSeek，因此目前启用记忆时必须显式选择已实现的 legacy。
+
+### 9.4 交付状态
+
+本次为未经编码后审查和验证的 coding 交付。shape、梯度、full/decode、beam reorder、初始化、模型保存恢复及旧算法公式迁移的正确性均未在本阶段验证，不作已通过声明。后续验证范围继续使用第 5 节，不增加跨版本兼容验收。

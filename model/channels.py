@@ -1,4 +1,4 @@
-"""Residual channel contracts; concrete implementations begin in stage 2.
+"""Residual channel implementations and depth-local state.
 
 initialize(hidden) -> ChannelState
 read(state, branch) -> hidden, BranchContext
@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+from .common import RMSNorm
 
 
 @dataclass(frozen=True)
@@ -43,9 +45,41 @@ class BranchContext:
     next_pre_mix: torch.Tensor | None = None
 
 
+class SingleResidualChannel(nn.Module):
+    """One stream, with the existing pre-norm sublayers and final RMSNorm."""
+
+    def __init__(self, hidden_size, num_layers):
+        super().__init__()
+        self.branch_norms = nn.ModuleList([
+            nn.ModuleDict({"attention": RMSNorm(hidden_size), "ffn": RMSNorm(hidden_size)})
+            for _ in range(num_layers)
+        ])
+        self.final_norm = RMSNorm(hidden_size)
+
+    def initialize(self, hidden):
+        return ChannelState(hidden.unsqueeze(2))
+
+    def read(self, state, branch):
+        layer_index, kind = branch
+        return self.branch_norms[layer_index][kind](state.streams.squeeze(2)), BranchContext()
+
+    def write(self, state, branch_output, context):
+        return ChannelState(state.streams + branch_output.unsqueeze(2))
+
+    def inject(self, state, delta):
+        if delta.shape != state.streams.shape:
+            raise ValueError("Engram delta must have the same [B,S,R,D] shape as streams")
+        return ChannelState(state.streams + delta)
+
+    def finalize(self, state):
+        return self.final_norm(state.streams.squeeze(2))
+
+
 def build_residual_channel(config) -> nn.Module:
     """Sole construction entry; never silently fall back to single."""
+    if config.residual_variant == "single":
+        return SingleResidualChannel(config.hidden_size, config.num_hidden_layers)
     raise NotImplementedError(
         f"Residual channel {config.residual_variant!r} is configured but not implemented yet; "
-        "single, gr4 and mhc4 arrive in stages 2, 4 and 5 respectively"
+        "gr4 and mhc4 arrive in stages 4 and 5 respectively"
     )
