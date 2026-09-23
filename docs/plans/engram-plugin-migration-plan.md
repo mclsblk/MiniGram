@@ -364,3 +364,43 @@ GR4 已接入现有通道接口。每层 attention／FFN 分别注册 GRMixer，
 GR 线性参数按 initializer_range 正态初始化，零中心 norm 权重为零；顶层 post_init 后通过通道统一初始化入口恢复。关闭 Engram 时可选择 gr4；legacy＋gr4 仍拒绝，Qwen／DeepSeek 尚未接入。
 
 本次与阶段 5 连续施工，分别本地提交；沿用直接编码交付约定，不执行编码后审查、静态检查或模型运行验证。动态读写、参数注册、梯度、初始化、full/decode 及普通 FFN／MoE 路径仍待运行验证。
+
+
+## 13. 阶段 5：mHC4 编码交付及当前可用范围
+
+mHC4 已接入相同通道接口。每层 attention／FFN 分别注册动态投影、base、scale 及 DeepSeek 风格 RMSNorm；末端单独注册 final_norm。公共组件新增 DeepSeekRMSNorm，保留先在 FP32 归一化并乘权重、再转换 dtype 的参考顺序，不改变 single 或 GR 的 norm。
+
+每次 forward 扩展四条 streams 并新建均衡初始 pre（各 1/4）。分支先从完整 streams 生成系数，再用上一分支的 pre collapse、norm、运行子层；写回按 comb 的 `[source, destination]` 方向混合残差，加上 post 加权子层输出，并保存本分支生成的 pre。最后一个 pre 用于末端 collapse。ChannelState 不进入 decode cache；Engram inject 保留当前 pre。
+
+系数投影与 Sinkhorn 显式关闭 autocast 并使用 FP32。按参考先 row softmax 加 eps、再归一化列，随后执行 19 轮行列归一化，总计 20 轮，eps 为 1e-6。pre 使用 sigmoid 加 eps，post 使用两倍 sigmoid。MiniGram 初始化为 pre base `-log(3)`、post base 0、comb 对角 logits 8／非对角 0、动态 scale 0.01；动态投影按 initializer_range 正态初始化，因此 pre／post 是约 1/4／约 1。顶层 post_init 后恢复这些初始化。此处不声称复现参考训练初始化。
+
+当前关闭 Engram 时可选 single、gr4、mhc4；开启 Engram 仍只可选 legacy＋single。Qwen／DeepSeek 实现及其多通道接入留待阶段 6／7。第 9 节记录的 GR4／mHC4 未实现状态已被本节替代。
+
+以下为后置验证入口示例，尚未执行；按第 5 节继续覆盖 full/decode、梯度、参数保存恢复、Sinkhorn 行列和、delayed pre 及初始化：
+
+```bash
+python - <<'PYCODE'
+import torch
+from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
+for variant in ("gr4", "mhc4"):
+    for moe in (False, True):
+        config = MiniGramConfig(
+            hidden_size=32, num_hidden_layers=2, vocab_size=64,
+            num_attention_heads=4, num_kv_heads=2, intermediate_size=64,
+            max_length=32, dropout=0.0, flash_attention=False,
+            use_engrams=False, residual_variant=variant, use_moe=moe,
+        )
+        model = MiniGramForCausalLM(config)
+        tokens = torch.randint(0, config.vocab_size, (2, 8))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        output = model(tokens, labels=tokens, use_cache=False)
+        loss = output.loss + output.aux_loss
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+        optimizer.step()
+        print(variant, moe, float(loss.detach()))
+PYCODE
+```
+
+本阶段仅编码交付，未进行编码后审查、AST 解析、git diff --check 或运行验证；数值与算法验收尚未完成。未修改训练／推理脚本、依赖或测试文件，未推进阶段 6。

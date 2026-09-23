@@ -43,3 +43,17 @@ class QwenRMSNorm(nn.Module):
         if self.group_size is not None:
             values = values.flatten(-2)
         return (values * (1.0 + self.weight.float())).to(hidden_states.dtype)
+
+
+class DeepSeekRMSNorm(nn.Module):
+    """Reference norm: normalize and apply the weight in FP32, then cast."""
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states):
+        values = hidden_states.float()
+        values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + self.eps)
+        return (values * self.weight.float()).to(hidden_states.dtype)
