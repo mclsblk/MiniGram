@@ -16,6 +16,9 @@ from torch import nn
 import torch.nn.functional as F
 
 from .common import RMSNorm
+from .validation import (
+    validate_engram_selection, validate_engram_options, validate_engram_parameters,
+)
 
 
 @dataclass(frozen=True)
@@ -54,52 +57,19 @@ def resolve_engram_spec(variant, overrides, hidden_size):
                          memory_store="packed", readout="deepseek_signed_sqrt",
                          postprocessor="identity", insertion="before_attention"),
     }
-    if variant not in presets:
-        raise ValueError(f"Unknown engram_variant: {variant!r}")
-    if overrides is None:
-        overrides = {}
-    unknown = set(overrides) - {field.name for field in fields(EngramSpec)}
-    if unknown:
-        raise ValueError(f"Unknown engram_overrides fields: {sorted(map(str, unknown))}")
+    overrides = {} if overrides is None else overrides
+    validate_engram_selection(variant, overrides, presets, {field.name for field in fields(EngramSpec)})
     values = {**presets[variant], "bucket_size": 1024, "num_heads": 4, **overrides}
-    choices = {
-        "token_mapper": ("identity", "compressed"),
-        "hasher": ("legacy", "qwen_xor", "deepseek_xor"),
-        "memory_store": ("separate", "packed"),
-        "readout": ("legacy", "qwen_signed_sqrt", "deepseek_signed_sqrt"),
-        "postprocessor": ("identity", "legacy_conv", "causal_conv"),
-        "insertion": ("before_attention", "after_attention"),
-    }
-    for name, supported in choices.items():
-        if values[name] not in supported:
-            raise ValueError(f"engram_overrides.{name} must be one of {supported}")
+    validate_engram_options(values)
     orders = values["ngram_orders"]
-    if not orders or any(order < 2 for order in orders) or list(orders) != sorted(set(orders)):
-        raise ValueError("engram_overrides.ngram_orders must be nonempty, strictly increasing integers >= 2")
     values["ngram_orders"] = tuple(orders)
-    if values["bucket_size"] < 2:
-        raise ValueError("engram_overrides.bucket_size must be at least 2")
-    if values["num_heads"] <= 0:
-        raise ValueError("engram_overrides.num_heads must be positive")
     values.setdefault("head_dim", math.ceil(hidden_size / (len(orders) * values["num_heads"])))
-    if values["head_dim"] <= 0:
-        raise ValueError("engram_overrides.head_dim must be positive")
     processor = values["postprocessor"]
     values.setdefault("conv_kernel_size", {"identity": 1, "legacy_conv": 3, "causal_conv": 4}[processor])
     values.setdefault("conv_dilation", max(orders) if processor == "causal_conv" else 1)
-    if processor != "identity":
-        for name in ("conv_kernel_size", "conv_dilation"):
-            if values[name] <= 0:
-                raise ValueError(f"engram_overrides.{name} must be positive for {processor}")
-    if processor == "legacy_conv" and values["conv_dilation"] != 1:
-        raise ValueError("legacy_conv requires conv_dilation=1; use causal_conv for dilation")
     hasher = values["hasher"]
     values.setdefault("hash_seed", {"legacy": 17, "qwen_xor": 1234, "deepseek_xor": None}[hasher])
-    if hasher == "deepseek_xor":
-        if values["hash_seed"] is not None:
-            raise ValueError("deepseek_xor derives seeds from layer IDs; hash_seed must be None")
-    elif values["hash_seed"] < 0:
-        raise ValueError(f"{hasher} requires a nonnegative hash_seed")
+    validate_engram_parameters(values)
     return EngramSpec(**values)
 
 

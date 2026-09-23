@@ -344,3 +344,14 @@ model = MiniGramForCausalLM(config)
 保留未知 overrides、废弃字段、不支持组合、cache 层数和 delta 精确形状等检查。residual_channels 的序列化及一致性约束保持现状，本次不扩展配置接口调整范围。
 
 按本次交付约定，清理完成后不执行编码后审查、AST 解析、git diff --check 或运行验证。这里只记录代码变更，不表示算法或运行验收通过；阶段 4 及后续阶段尚未开始。
+
+
+## 11. 校验边界集中维护
+
+经用户确认，新增 `model/validation.py`，集中维护模型配置、Engram 配置及组合约束、外部 cache 容器校验。原四个模型模块的计算职责不变；新增文件只承担边界校验。
+
+依赖方向固定为主模型 → Engram → validation，以及主模型 → validation。validation 不导入主模型、Engram 或 channels，不引用具体状态类，只读取普通配置字段和外部 cache 容器；不解析默认值、不修改参数、不构造组件。
+
+主模型配置入口调用模型配置及组合校验，Engram resolver 在解析依赖默认值前后分别调用对应配置校验。forward 入口集中检查 cache 容器、层数及 use_cache；beam reorder 入口复用同一函数。删除 EngramState 的具体类检查，内部直接按状态接口访问字段和 reorder 方法。
+
+本次为职责迁移及具体类检查删除，不宣称迁移校验代码减少了总体代码量。算法分支、未实现组件的显式错误和通道 delta 形状约束不变。按交付约定，不执行编码后审查、静态检查或运行验证，不推进阶段 4。

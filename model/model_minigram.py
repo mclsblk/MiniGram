@@ -5,7 +5,10 @@ import torch
 import math
 
 from .channels import build_residual_channel
-from .engram import EngramState, build_engram_layers, resolve_engram_spec
+from .engram import build_engram_layers, resolve_engram_spec
+from .validation import (
+    validate_model_config, validate_engram_combination, validate_past_key_values,
+)
 
 
 class MiniGramConfig(PretrainedConfig):
@@ -19,39 +22,18 @@ class MiniGramConfig(PretrainedConfig):
         residual_variant: str = "single", residual_low_rank: Optional[int] = None,
         **kwargs,
     ):
-        deprecated = {
-            "engram_vocab_size": "bucket_size",
-            "engram_n_gram_list": "ngram_orders",
-            "engram_num_heads": "num_heads",
-            "engram_conv_size": "conv_kernel_size",
-            "engram_hash_seed": "hash_seed",
-        }
-        supplied = sorted(deprecated.keys() & kwargs.keys())
-        if supplied:
-            replacements = ", ".join(f"{name} -> {deprecated[name]}" for name in supplied)
-            raise ValueError(f"Removed Engram configuration fields; use engram_overrides instead: {replacements}")
-        for name, value in (("hidden_size", hidden_size), ("num_hidden_layers", num_hidden_layers)):
-            if value <= 0:
-                raise ValueError(f"{name} must be positive")
-        channel_counts = {"single": 1, "gr4": 4, "mhc4": 4}
-        if residual_variant not in channel_counts:
-            raise ValueError(f"Unknown residual_variant: {residual_variant!r}")
-        channels = channel_counts[residual_variant]
-        supplied_channels = kwargs.pop("residual_channels", channels)
-        if supplied_channels != channels:
-            raise ValueError(f"residual_variant={residual_variant!r} requires residual_channels={channels}")
-        rank = min(64, hidden_size) if residual_low_rank is None else residual_low_rank
-        if residual_variant == "gr4" and rank <= 0:
-            raise ValueError("residual_low_rank must be positive for gr4")
         layers = [1] if engram_n_layer_list is None else engram_n_layer_list
-        if any(layer < 0 for layer in layers) or len(set(layers)) != len(layers):
-            raise ValueError("engram_n_layer_list must contain distinct nonnegative integer layer indices")
-        if use_engrams and any(layer >= num_hidden_layers for layer in layers):
-            raise ValueError("engram_n_layer_list contains an index outside num_hidden_layers")
+        rank = min(64, hidden_size) if residual_low_rank is None else residual_low_rank
+        validate_model_config(
+            hidden_size, num_hidden_layers, residual_variant, rank,
+            layers, use_engrams, kwargs,
+        )
+        channels = {"single": 1, "gr4": 4, "mhc4": 4}[residual_variant]
+        kwargs.pop("residual_channels", None)
         spec = resolve_engram_spec(engram_variant, engram_overrides, hidden_size)
-        if use_engrams and channels != 1:
-            if engram_variant == "legacy" or spec.readout == "legacy" or spec.postprocessor == "legacy_conv":
-                raise ValueError("legacy Engram, readout and convolution require residual_variant='single'")
+        validate_engram_combination(
+            use_engrams, engram_variant, residual_variant, spec.readout, spec.postprocessor,
+        )
         # to_dict() stores rope_factors; preserve it when reconstructing a config.
         saved_rope_factors = kwargs.pop("rope_factors", None)
         super().__init__(**kwargs)
@@ -158,20 +140,6 @@ def _get_past_length(past_key_value):
     attn_cache = past_key_value["attn"]
     return 0 if attn_cache is None else attn_cache[0].size(1)
 
-def _validate_past_key_values(past_key_values):
-    if past_key_values is None:
-        return None
-    if not isinstance(past_key_values, (list, tuple)):
-        raise TypeError("past_key_values must be a sequence of layer dictionaries")
-    for cache in past_key_values:
-        if not isinstance(cache, dict) or set(cache) - {"attn", "engram"}:
-            raise ValueError("Layer cache accepts only 'attn' and 'engram'; old cache formats are unsupported")
-        if cache.get("engram") is not None and not isinstance(cache["engram"], EngramState):
-            raise TypeError("The 'engram' cache entry must be an EngramState")
-        attn = cache.get("attn")
-        if attn is not None and (not isinstance(attn, tuple) or len(attn) != 2):
-            raise TypeError("The 'attn' cache entry must be a (key, value) tuple")
-    return past_key_values
 
 
 class SimpleAttention(nn.Module):
@@ -371,12 +339,7 @@ class MiniGramModel(nn.Module):
         new_past_key_values = [] if use_cache else None
         aux_loss = hidden_states.new_zeros(())
         seq_length = input_ids.size(1)
-        past_key_values = _validate_past_key_values(past_key_values)
-        if past_key_values is not None:
-            if not use_cache:
-                raise ValueError("Supplying past_key_values requires use_cache=True")
-            if len(past_key_values) != len(self.layers):
-                raise ValueError("past_key_values must contain one cache per layer")
+        validate_past_key_values(past_key_values, len(self.layers), use_cache)
         past_length = _get_past_length(past_key_values[0]) if past_key_values else 0
         precompute_freqs = (
             self.precompute_freqs_cos[past_length:past_length + seq_length],
@@ -444,7 +407,8 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
 
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        caches = _validate_past_key_values(past_key_values)
+        validate_past_key_values(past_key_values, self.config.num_hidden_layers)
+        caches = past_key_values
         if caches is None:
             return None
         reordered = []
