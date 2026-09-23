@@ -4,10 +4,61 @@ from typing import Optional
 import torch
 import math
 
+from .channels import build_residual_channel
+from .common import RMSNorm
+from .engram import build_engram_layers, resolve_engram_spec
+
+
 class MiniGramConfig(PretrainedConfig):
     model_type = "minigram"
 
-    def __init__(self, hidden_size: int = 768, num_hidden_layers: int = 12, **kwargs):
+    def __init__(
+        self, hidden_size: int = 768, num_hidden_layers: int = 12,
+        use_engrams: bool = False, engram_variant: str = "deepseek",
+        engram_overrides: Optional[dict] = None,
+        engram_n_layer_list: Optional[list[int]] = None,
+        residual_variant: str = "single", residual_low_rank: Optional[int] = None,
+        **kwargs,
+    ):
+        deprecated = {
+            "engram_vocab_size": "bucket_size",
+            "engram_n_gram_list": "ngram_orders",
+            "engram_num_heads": "num_heads",
+            "engram_conv_size": "conv_kernel_size",
+            "engram_hash_seed": "hash_seed",
+        }
+        supplied = sorted(deprecated.keys() & kwargs.keys())
+        if supplied:
+            replacements = ", ".join(f"{name} -> {deprecated[name]}" for name in supplied)
+            raise ValueError(f"Removed Engram configuration fields; use engram_overrides instead: {replacements}")
+        for name, value in (("hidden_size", hidden_size), ("num_hidden_layers", num_hidden_layers)):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if type(use_engrams) is not bool:
+            raise ValueError("use_engrams must be a boolean")
+        channel_counts = {"single": 1, "gr4": 4, "mhc4": 4}
+        if not isinstance(residual_variant, str) or residual_variant not in channel_counts:
+            raise ValueError(f"Unknown residual_variant: {residual_variant!r}")
+        channels = channel_counts[residual_variant]
+        supplied_channels = kwargs.pop("residual_channels", channels)
+        if type(supplied_channels) is not int or supplied_channels != channels:
+            raise ValueError(f"residual_variant={residual_variant!r} requires residual_channels={channels}")
+        rank = min(64, hidden_size) if residual_low_rank is None else residual_low_rank
+        if type(rank) is not int or rank <= 0:
+            raise ValueError("residual_low_rank must be a positive integer")
+        layers = [1] if engram_n_layer_list is None else engram_n_layer_list
+        if (not isinstance(layers, (list, tuple))
+                or any(type(layer) is not int or layer < 0 for layer in layers)
+                or len(set(layers)) != len(layers)):
+            raise ValueError("engram_n_layer_list must contain distinct nonnegative integer layer indices")
+        if use_engrams and any(layer >= num_hidden_layers for layer in layers):
+            raise ValueError("engram_n_layer_list contains an index outside num_hidden_layers")
+        spec = resolve_engram_spec(engram_variant, engram_overrides, hidden_size)
+        if use_engrams and channels != 1:
+            if engram_variant == "legacy" or spec.readout == "legacy" or spec.postprocessor == "legacy_conv":
+                raise ValueError("legacy Engram, readout and convolution require residual_variant='single'")
+        # to_dict() stores rope_factors; preserve it when reconstructing a config.
+        saved_rope_factors = kwargs.pop("rope_factors", None)
         super().__init__(**kwargs)
         
         self.hidden_size = hidden_size
@@ -25,7 +76,7 @@ class MiniGramConfig(PretrainedConfig):
         self.bos_token_id = kwargs.get("bos_token_id", 0)
         self.eos_token_id = kwargs.get("eos_token_id", 1)
         self.flash_attention = kwargs.get("flash_attention", True if torch.cuda.is_available() else False)
-        rope_scaling_params = kwargs.get("rope_scaling_params", None)
+        rope_scaling_params = kwargs.get("rope_scaling_params", saved_rope_factors)
         self.rope_theta = kwargs.get("rope_theta", 100000.0)
         
         # MoE parameters
@@ -34,14 +85,14 @@ class MiniGramConfig(PretrainedConfig):
         self.num_expert_per_token = kwargs.get("num_expert_per_token", 2)
         self.aux_loss_coef = kwargs.get("aux_loss_coef", 0.01)
         
-        # Engram parameters
-        self.use_engrams = kwargs.get("use_engrams", False)
-        self.engram_vocab_size = kwargs.get("engram_vocab_size", 1024)
-        self.engram_n_layer_list = kwargs.get("engram_n_layer_list", [1])
-        self.engram_n_gram_list = kwargs.get("engram_n_gram_list", [2, 3])
-        self.engram_num_heads = kwargs.get("engram_num_heads", 4)
-        self.engram_conv_size = kwargs.get("engram_conv_size", 3)
-        self.engram_hash_seed = kwargs.get("engram_hash_seed", 17)
+        # Only resolved, JSON-compatible configuration is retained, never modules.
+        self.use_engrams = use_engrams
+        self.engram_variant = engram_variant
+        self.engram_overrides = spec.to_dict()
+        self.engram_n_layer_list = sorted(layers)
+        self.residual_variant = residual_variant
+        self.residual_channels = channels
+        self.residual_low_rank = rank
         
         self.rope_factors = {
             "beta_fast": 16.0,
@@ -138,20 +189,6 @@ def _normalize_past_key_values(past_key_values):
     return past_key_values
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        return self.weight * hidden_states.to(input_dtype)
-
-
 class SimpleAttention(nn.Module):
     def __init__(self, config: MiniGramConfig):
         super().__init__()
@@ -230,6 +267,8 @@ class SimpleAttention(nn.Module):
 
 
 class EngramModule(nn.Module):
+    # Historical formula source, unreachable through MiniGramModel in stage 1.
+    # Stage 3 replaces this class with the new pipeline; this is not an old API shim.
     def __init__(self, config: MiniGramConfig, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
@@ -476,6 +515,11 @@ class MiniGramModel(nn.Module):
     def __init__(self, config: MiniGramConfig):
         super().__init__()
         self.config = config
+        # Stage 2 replaces the direct single-stream flow with the channel API.
+        # Until then, fail explicitly rather than running a requested GR/mHC as single.
+        if config.residual_variant != "single":
+            build_residual_channel(config)
+        self.engrams = build_engram_layers(config)
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):

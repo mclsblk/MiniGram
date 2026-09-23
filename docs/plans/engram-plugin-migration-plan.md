@@ -211,6 +211,61 @@ git rev-parse codex/legacy-v1 minigram-legacy-v1
 
 ## 7. 阶段进度
 
-- **阶段 0 已落实**：建立本地冻结分支与 tag；以方案 B 替换旧计划；记录新接口、支持范围、参考指纹与静态检查命令。模型实现未修改。
-- **阶段 1～8 未开始**：需用户明确确认下一阶段后继续；每阶段完成后更新本节。
+- **阶段 0 已落实**：建立本地冻结分支与 tag；以方案 B 替换旧计划；记录新接口、支持范围、参考指纹与静态检查命令。阶段 0 未修改模型实现。
+- **阶段 1 已落实**：新增公共 norm、解析后的 EngramSpec、新配置校验、显式状态和集中 builder 入口；算法构建尚未开放，详见第 8 节。配置序列化往返和状态重排仅完成实现及静态审查，未运行验证。
+- **阶段 2～8 未开始**：需用户明确确认下一阶段后继续；每阶段完成后更新本节。
 - **运行验证全部待执行**：当前没有算法、数值、梯度、保存恢复或增量推理通过的结论。
+
+## 8. 阶段 1：已落地的接口与中间版本限制
+
+### 8.1 公共组件与依赖
+
+- `common.py` 提供 `RMSNorm` 和 `QwenRMSNorm`。前者保留 MiniGram 的先回转 dtype 再乘权重顺序；后者使用零中心权重、可选分组和 FP32 乘权重后回转 dtype。
+- `engram.py` 提供配置解析、`EngramSpec`、`EngramState` 和 `build_engram_layers()`。
+- `channels.py` 提供 `ChannelState`、`BranchContext` 和 `build_residual_channel()`。
+- 主模型导入上述基础接口；三个新文件均不导入主模型。配置解析函数只产生数据，不构造模块；每类插件仍只有一个模块构建入口。
+
+### 8.2 新配置字段
+
+`MiniGramConfig` 显式接收公共开关、variant、overrides、插入层列表和 GR rank。`engram_overrides` 在构造配置时展开为完整的有效字段；配置保存普通字典和列表，不保存 dataclass、模块或 Tensor。派生的 `residual_channels` 为 1 或 4，重新读取配置时检查其与 variant 一致。
+
+以下是三种预设共用的浅层 overrides，组件名直接标明参考计算的差异：
+
+| 字段 | 可选值或含义 |
+| --- | --- |
+| `ngram_orders` | 非空、严格递增、至少为 2 的整数列表；legacy／qwen 默认 `[2, 3]`，deepseek 默认 `[2, 3, 4]` |
+| `token_mapper` | `identity`、`compressed` |
+| `hasher` | `legacy`、`qwen_xor`、`deepseek_xor`；后两者的 multiplier／seed 生成不能混同 |
+| `memory_store` | `separate`、`packed` |
+| `readout` | `legacy`、`qwen_signed_sqrt`、`deepseek_signed_sqrt`；保留各自 norm 和门控语义 |
+| `postprocessor` | `identity`、`legacy_conv`、`causal_conv` |
+| `insertion` | `before_attention`、`after_attention` |
+| `bucket_size`、`num_heads`、`head_dim` | bucket 基数、每阶 head 数、每 head 向量宽度；默认按第 3.1 节解析 |
+| `hash_seed` | legacy 默认 17；Qwen 默认参考值 1234；DeepSeek 为 `None`，按参考从层号派生 seed，不接受人为覆盖 |
+| `conv_kernel_size`、`conv_dilation` | legacy 默认 3／1；Qwen causal_conv 默认 4／最大 n-gram 阶数；identity 默认 1／1 且后续不会创建卷积 |
+
+旧字段 `engram_vocab_size`、`engram_n_gram_list`、`engram_num_heads`、`engram_conv_size`、`engram_hash_seed` 一律报错并给出 overrides 中的替代字段，不提供自动映射。布尔值不能冒充整数容量；未知组件、重复或乱序 n-gram、错误通道数等在构造配置时拒绝。
+
+插入层使用零基索引，保存时排序；始终校验整数、非负和去重，启用 Engram 时检查层号上界。未启用时保留默认 `[1]`，不会因此阻止单层无 Engram 模型。legacy 预设、legacy readout 或 legacy convolution 启用时均仅用于 single。
+
+### 8.3 状态与 builder 契约
+
+- `EngramState.hash_tail` 为 `[B,T]` 的哈希域上下文，包含对应算法的边界标记；`post_state` 为可选 `[B,T,R,D]` 卷积输入历史。`reorder(beam_idx)` 返回新的状态，按各 tensor 所在设备执行 batch 索引，不修改原状态。
+- `ChannelState.streams` 为 `[B,S,R,D]`，`pre_mix` 为可选 FP32 `[B,S,R]`。它们不是 decode cache。
+- `BranchContext` 只保存 `post_mix`、`comb_mix` 和 `next_pre_mix`。single 均不用，GR 使用 post，mHC 使用三者；由一次 read 产生，紧接着交给对应 write。
+- 通道 `branch` 标识为 `(layer_index, "attention" 或 "ffn")`，因此集中通道模块能够持有各层各分支独立参数，而不是全模型共享一份映射。
+- `build_engram_layers(config)` 的返回类型为按层号字符串索引的 `nn.ModuleDict`；禁用 Engram 时返回空模块集合。`build_residual_channel(config)` 是唯一通道模块构建入口。具体算法在后续阶段接入这些入口。
+
+### 8.4 当前可达路径与待运行验证
+
+本阶段保留主模型原有的 **关闭 Engram＋single** 直连路径，尚未改成通道 API。构造配置与实例化算法是两件事：配置可以描述所有目标预设，但本阶段尝试在模型中启用任何 Engram、GR4 或 mHC4 都会显式抛出 `NotImplementedError`，并提示对应实施阶段，不会静默退化。
+
+旧 `EngramModule` 定义暂留主文件作为阶段 3 的公式迁移来源。它已不在本阶段顶层模型的可达构造路径中，不属于新版 API，也没有通过补回旧配置字段让它继续工作。阶段 3 将用新管线替换该定义及旧连接代码。
+
+当前源码已提供配置的普通数据序列化结构和状态 reorder 实现，但以下运行检查仍后置：
+
+- `MiniGramConfig.to_dict()`／JSON 保存后重新构造是否保留完整有效配置及自定义 RoPE 设置。
+- 各非法配置是否按预期报错、禁用 Engram 时是否不创建记忆参数。
+- `EngramState.reorder()` 对重复 beam 索引和设备位置的行为。
+- 公共 norm 的 dtype、分组、参数初始化和数值行为。
+- 后续阶段接入后，无 Engram 主模型、五段管线和通道生命周期的运行行为。
