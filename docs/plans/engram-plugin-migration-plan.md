@@ -1,522 +1,216 @@
-# MiniGram Engram 插件化与多通道迁移计划
+# MiniGram 模型模块重构计划：保留 legacy 算法，取消旧版兼容
 
-## 1. 目标与边界
+## 1. 目标与实施边界
 
-本次迁移将 `model/model_minigram.py` 中的 Engram、残差通道和模型组装逻辑拆开，使 MiniGram 能用一套统一接口展示并运行三类配置：
+采用方案 B：新版保留 legacy、Qwen、DeepSeek 三种记忆算法，统一使用新接口；旧工程冻结保存，新版不承担旧权重、旧配置、旧 cache、旧类调用、旧 optimizer 或旧 LoRA 的兼容责任。
 
-- 当前 MiniGram 的简化 Engram，作为行为和旧权重兼容基线；
-- Qwen3.8-Flash 风格的记忆 gram 与 GR4 通道；
-- DeepSeek-V4.1-Flash 风格的 Engram 与 mHC4 通道。
+已确认的默认行为：
 
-迁移后的代码应满足四个目标：
+- `use_engrams` 默认仍为 `False`。
+- 开启 Engram 时，默认使用 **deepseek＋single**。
+- DeepSeek 映射未就绪时，允许构造模型，但 forward 明确报错；不自动降级为 identity。
+- legacy 仅支持 single；Qwen、DeepSeek 可搭配 single、GR4、mHC4。关闭 Engram 时三种通道均可使用。
 
-1. 主模型文件只保留模型组件定义、层级连接和最终组装。
-2. Engram 内部步骤可独立替换，卷积、token compression 等组件可以按需启用或移除。
-3. single、GR4 和 mHC4 通过相同的通道接口接入，不把条件分支散落到 Transformer 层的 `forward` 中。
-4. 默认配置完整保持当前 MiniGram 的数值行为、调用方式和旧 `.pth` 权重兼容性。
+本轮只修改模型与文档。训练、推理、checkpoint 和 LoRA 工具的接入放到以后；旧脚本在新版中的可用性不作承诺，文档明确这一限制。
 
-本阶段只迁移模型侧结构。训练器继续使用项目现有逻辑，不引入 Muon 等新优化器、GRPO 或训练时冻结 Engram 的策略。
+实施控制保持不变：
 
-## 2. 目标文件结构
+- 先在基线提交 `2b7125e88906cbe1e1e5dd803f0e1651860c44aa` 建立本地冻结分支 `codex/legacy-v1` 和 tag `minigram-legacy-v1`。
+- 每阶段独立本地提交，汇报后等待用户明确确认下一阶段。
+- 暂不 push、不通知远端任务、不安装依赖、不运行模型数值验证。
+- 出现算法取舍、接口变更或范围扩张时，先询问用户，不自行修改已确认决策。
 
-采用接近 DeepSeek 原始实现的精简结构，只新增两个模型文件：
+## 2. 模块结构与算法范围
+
+### 2.1 文件划分
+
+采用四文件结构：
 
 ```text
 model/
-├── model_minigram.py   # 基础模块、Transformer 层、MiniGram 组装
-├── engram.py           # Engram 组件、预设、状态与构建器
-└── channels.py         # single、GR4、mHC4 通道实现
+├── model_minigram.py   # 基础网络组件、层级连接、主模型组装
+├── engram.py           # 五段记忆管线、预设、状态、映射 helper、集中 builder
+├── channels.py         # single、GR4、mHC4 及集中 builder
+└── common.py           # 确实共享的基础组件
 ```
 
-不继续拆出 `hash.py`、`memory.py`、`kernel.py` 或单独的配置目录。Engram 的紧密相关实现集中在 `engram.py`，通道逻辑集中在 `channels.py`，以便学习和对照论文。
+**暂不新增独立 legacy 文件。**旧 Engram 约 140 行，拆出共用查表、状态与组装后，其专属逻辑集中维护在 `engram.py` 的 legacy 区段即可。不保留完整旧模型副本，也不创建旧 API wrapper。
 
-### 2.1 精简实现约束
+依赖保持单向：公共组件不反向导入主模型，Engram 与通道不依赖主模型的运行时定义。不同算法的 norm 参数化及 dtype 语义分别保留，不因共享文件而强行统一。
 
-本计划中的“插件”只表示模型包内部可替换的 PyTorch 组件，不建设通用插件系统。实现必须延续项目当前直接、紧凑的代码风格，并遵守以下约束：
+继续使用普通函数、轻量 dataclass 和 `nn.Module`。不引入动态注册表、插件发现、抽象类体系、多级 factory 或泛化上下文。
 
-- 优先使用普通函数、`nn.Module` 和轻量 `dataclass`，不为每个插槽建立抽象基类或多层继承体系；只要调用签名一致，就不额外引入 `Protocol`、ABC 或 adapter 层。
-- 不引入动态注册表、插件发现、entry point、依赖注入、服务定位器、事件 hook 或生命周期框架。组件选择由一个集中 builder 使用简单映射或条件分支完成。
-- `EngramSpec`、`EngramState` 和 `ChannelState` 只保存当前三类预设实际需要的字段，不为未知的未来变体预留通用元数据、嵌套配置树或扩展上下文。
-- Engram 和 channel 各自最多保留一层构建函数；配置解析、合法性检查和模块实例化应集中完成，不拆成多级 factory。
-- 只实现本计划明确列出的组件与组合，不为尚未出现的第四种 Engram、第五种通道或外部第三方组件设计扩展框架。
-- 继续维持三个模型文件的边界，不因单个 mapper、hasher、readout 或 mixer 新增文件或目录。
-- 不新增或修改测试文件，不建立 golden fixture、组合测试矩阵或专用测试框架。必要验证复用现有检查，或使用不提交到仓库的一次性运行命令。
+### 2.2 Engram 管线
 
-以下规模作为代码评审触发线，而不是牺牲可读性的硬限制：
-
-| 范围 | 建议规模 |
-| --- | ---: |
-| `model/engram.py` | 约 450～700 行，包含迁入的 legacy 实现 |
-| `model/channels.py` | 约 250～400 行 |
-| `model_minigram.py` 新增集成逻辑 | 约 80～150 行 |
-
-若明显超过上述范围，应先检查是否出现了重复包装、过度泛化或可合并的构建层。只有具体算法公式、旧权重兼容或增量推理状态确实需要时才扩大实现。上述精简约束不得改变 legacy、Qwen、DeepSeek、single、GR4、mHC4 的核心计算逻辑，也不得删除全序列与增量推理共享实现、旧权重兼容或显式状态管理要求。
-
-## 3. 总体组装方式
-
-模型配置使用两个正交选择项：
-
-```python
-MiniGramConfig(
-    use_engrams=True,
-    engram_variant="qwen",
-    engram_overrides={
-        "postprocessor": "identity",
-    },
-    residual_variant="gr4",
-)
-```
-
-- `engram_variant` 选择记忆 gram 的默认拓扑和算法。
-- `engram_overrides` 覆盖预设中的单个组件，用于消融和教学展示。
-- `residual_variant` 选择残差通道系统。
-- `engram_n_layer_list` 独立决定在哪些 Transformer 层插入 Engram。
-
-预设决定算法结构，本地实验规模由 `engram_vocab_size`、bucket 数、head 数和 head dimension 等参数控制。复现核心机制时不创建论文规模的巨大查找表。
-
-首个完整版本提供以下预设：
-
-| Engram 预设 | n-gram | token 映射 | 哈希 | 读出 | 后处理 | 默认插入位置 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `legacy` | 保持现状 | 原始 token | 当前实现 | 当前门控与归一化 | 当前卷积行为 | attention 后 |
-| `qwen` | 2/3-gram | 原始 token | prime rolling/XOR | signed-sqrt gate | dilated causal convolution | attention 前 |
-| `deepseek` | 2/3/4-gram | token compression | prime rolling/XOR | signed-sqrt gate | identity | attention 前 |
-
-通道预设为：
-
-| 通道 | 通道数 | 核心行为 | 第一阶段目标 |
-| --- | ---: | --- | --- |
-| `single` | 1 | 当前标准残差流 | 与现有实现逐元素兼容 |
-| `gr4` | 4 | 低秩逐维读取、分支写入、最终混合 | 复现 Qwen 的核心通道拓扑 |
-| `mhc4` | 4 | pre/post/comb 映射、Sinkhorn 双随机混合、跨层 carry | 复现 DeepSeek 的核心通道拓扑 |
-
-推荐的演示组合是 `legacy + single`、`qwen + gr4` 和 `deepseek + mhc4`，但配置层不硬编码这三个配对。用户可以组合其他 Engram 与通道，用于消融实验。
-
-## 4. Engram 插件结构
-
-### 4.1 `EngramSpec`
-
-`engram.py` 定义一个轻量配置对象 `EngramSpec`。它描述五个可替换插槽，并包含 n-gram 阶数、边界规则、门控参数、卷积参数和插入位置等必要设置。
-
-五个插槽为：
+保留五个组件插槽：
 
 ```text
-token_mapper  -> hasher -> memory_store -> readout -> postprocessor
+token_mapper → hasher → memory_store → readout → postprocessor
+                                           ↑
+                                完整 residual streams
 ```
 
-建议的内置组件：
+内部入口接收 `input_ids`、完整 `[B,S,R,D]` streams、可选 mask 和 `EngramState`；返回同形状的 `delta` 及更新后的状态。
 
-| 插槽 | 第一阶段实现 |
-| --- | --- |
-| `token_mapper` | `identity`、`compressed` |
-| `hasher` | `legacy`、`rolling_xor` |
-| `memory_store` | `separate`、`packed` |
-| `readout` | `legacy`、`signed_sqrt_rms`、`signed_sqrt_weighted` |
-| `postprocessor` | `identity`、`causal_conv` |
+- 门控读取各条 stream，不先压缩成单一 hidden。
+- Engram 完成逐流门控；通道只将 delta 加回 streams，不再追加写入门。
+- separate、packed 两种存储均实现且可切换，明确 head 顺序、各 head 容量、padding bucket 与 packed offset。
+- legacy 默认 separate；Qwen、DeepSeek 默认 packed。不提供已有 checkpoint 的跨布局转换器。
+- 删除额外的“多阶输出可学习加权”readout；保留参考算法自身需要的逐维 q/k 权重。
+- full、分块 prefill、逐 token decode 共用同一份哈希与卷积公式。
 
-预设只负责生成完整 `EngramSpec`。`engram_overrides` 在构造模块之前修改 spec，因而 `forward` 不需要根据字符串选择算法。
+| 预设 | 保留的算法机制 | 默认位置 |
+| --- | --- | --- |
+| legacy | 旧哈希、独立表布局、旧门控及归一化、旧卷积残差行为 | attention 后 |
+| qwen | 2/3-gram、原 token、参考 signed-sqrt 门控、膨胀 depthwise 因果卷积 | attention 前 |
+| deepseek | 2/3/4-gram、参考 token compression、参考 signed-sqrt 门控、identity 后处理 | attention 前 |
 
-这里的插槽是统一调用约定，不要求五套抽象接口类。内置组件直接实现约定的输入输出，并由 `build_engram_layers()` 集中实例化。
+legacy 保留旧公式，但采用新参数组织、配置、状态和返回值。不要求旧整模型逐元素一致，也不安排跨版本数值对照。
 
-示例：
+Qwen 卷积保留参考的 norm、SiLU 和残差组合；默认 kernel 为 4、dilation 为 3，历史长度按公式推导，不额外建设多尺度并联结构。
 
-```python
-# Qwen 核心，但去掉卷积
-MiniGramConfig(
-    engram_variant="qwen",
-    engram_overrides={"postprocessor": "identity"},
-)
+参考来源锁定为当前本地 Qwen／DeepSeek 源码快照，具体 SHA-256 与对应函数见第 6 节。算法存在的边界、归一化、哈希生成差异按参考保留。
 
-# DeepSeek 核心，但保留原始 token id
-MiniGramConfig(
-    engram_variant="deepseek",
-    engram_overrides={"token_mapper": "identity"},
-)
-```
+## 3. 新接口、配置和状态
 
-### 4.2 统一数据流
+### 3.1 统一配置
 
-Engram 的内部数据流固定为：
+三种预设统一通过 `engram_variant` 与浅层 `engram_overrides` 选择和调整，不再单独保留 legacy 的旧参数解析规则。
+
+保留公共控制字段：
+
+- `use_engrams`：是否启用记忆。
+- `engram_variant`：默认 `deepseek`。
+- `engram_overrides`：已知组件及算法参数的浅层覆盖。
+- `engram_n_layer_list`：插入层列表，默认 `[1]`。
+- `residual_variant`：默认 `single`。
+- `residual_low_rank`：GR 的低秩维度。
+
+旧 Engram 容量、算法字段不再自动映射；发现这些已废弃字段时明确报错并指向 overrides。没有旧配置兼容路径或旧权重自动识别逻辑。
+
+默认规模与校验：
+
+- bucket 基数 1024，每阶 4 heads。
+- head dimension 默认按 `ceil(hidden_size / 总memory_heads)` 计算，允许显式覆盖。
+- GR rank 默认 `min(64, hidden_size)`。
+- 通道数由 variant 决定为 1 或 4。
+- 校验按组件执行，不向 legacy 添加算法本身不需要的整除条件。
+- 未知覆盖字段、不支持的组合、非法容量或插入层在构造时明确报错。
+- 保存解析后的有效配置，支持新版配置自身的序列化往返；只承诺新版配置与新版权重配套恢复。
+
+### 3.2 通道接口与归一化
+
+统一采用显式读取和写回：
 
 ```text
-input_ids
-   │
-   ▼
-TokenMapper
-   │ mapped_ids
-   ▼
-NGramHasher
-   │ bucket_ids
-   ▼
-MemoryStore
-   │ retrieved vectors
-   ▼
-Readout
-   │ gated memory
-   ▼
-PostProcessor
-   │
-   ▼
-delta: [batch, sequence, residual_channels, hidden_size]
+initialize(hidden) → ChannelState
+read(state, branch) → hidden, branch_context
+子层计算(hidden) → branch_output
+write(state, branch_output, branch_context) → ChannelState
+inject(state, delta) → ChannelState
+finalize(state) → hidden
 ```
 
-统一输出为对残差流的增量 `delta`。single 通道时 `residual_channels=1`，GR4 和 mHC4 时通常为 4。Transformer 层只消费这个结果，不理解 token compression、哈希、查表或卷积细节。
+- attention、FFN 始终接收 `[B,S,D]`。
+- 通道参数按层、按分支独立注册；最终 mixer 单独注册。
+- `branch_context` 保存本次写回系数和下一分支信息，不藏在 module 的可变成员里。
+- single 使用标准 residual add；GR 遵循参考的分组归一化、动态读写和最终 mixer；mHC 遵循参考的 collapse、norm、post/comb 顺序。
+- 不把旧模型的 norm 无条件叠加到 GR 的归一化读出之后。
 
-### 4.3 token compression
+mHC 的 pre 沿模型深度延迟使用：attention 使用上一分支留下的 pre，本分支生成的 pre 给下一分支，最终 pre 用于模型末端归并。每次 forward 重新初始化通道状态，不跨 decode 调用复用上一 token 的 pre。
 
-DeepSeek 风格的 `CompressedTokenMapper` 使用持久化的 `token_map` buffer：
+mHC 使用 FP32 Sinkhorn，默认 20 次迭代、`eps=1e-6`。初始化采用近恒等残差与均衡读出：pre 约 `1/4`、post 为 `1`、comb logits 对角为 `8`、非对角为 `0`，动态 scale 为 `0.01`。这是 MiniGram 的初始化选择，不声称复现原模型训练初始化。特殊初始化不得被顶层初始化流程覆盖。
 
-- 提供离线构造映射表的 helper；
-- 提供模型级 setter，允许训练脚本注入由语料统计得到的映射；
-- 将映射表保存进 `state_dict`，确保推理时无需重新统计语料；
-- 未配置映射时显式报错或使用配置声明的 fallback，避免静默改变语义。
+### 3.3 Token map 与推理状态
 
-token compression 只改变哈希前的 token id，不修改 tokenizer、模型输入或语言模型词表。
+token compression 仅实现参考 tokenizer 文本归一化算法，提供离线 helper 与模型级 setter；不实现语料统计映射或任意自定义映射实验。
 
-### 4.4 哈希与边界
+- 允许先构造模型，再注入或加载映射。
+- 持久化 token map，并同步建立或恢复依赖压缩词表大小的哈希信息。
+- 首次 forward 前必须完成映射准备；不支持计算过程中更换映射。
+- 映射就绪后，推理无需重新处理 tokenizer。
 
-`rolling_xor` 负责多阶 n-gram bucket 地址计算，并将以下规则集中到同一个模块：
+`EngramState` 保存有限 token 历史和后处理历史，并实现 beam batch 重排。模型只使用新的 `engram` cache 字段，不读取或转换旧 `engram_tail/engram_conv` 格式。
 
-- 各阶 n-gram 使用独立的 prime 或 seed；
-- 使用稳定的整数运算，避免 Python 进程级 hash 随机性；
-- BOS、padding、序列开头和增量解码共享同一套边界定义；
-- 全序列 forward 与逐 token decode 得到相同 bucket id。
+`ChannelState` 是一次 forward 内沿层传播的计算状态；`EngramState` 才是跨 decode 调用的历史。二者不能混用。
 
-旧算法保留在 `legacy` hasher 中，以保证迁移前后行为一致。
+## 4. 分阶段实施
 
-### 4.5 memory store
+取消“先建立旧兼容层，再改造”的路线，改为先确定新契约、建立基础层，再分别接入算法。
 
-`MemoryStore` 只负责根据 bucket id 读取向量：
+| 阶段 | 工作 | 阶段检查重点 |
+| --- | --- | --- |
+| 0 | 冻结旧分支和 tag，更新计划，记录参考指纹、支持范围及接口 | 删除旧兼容承诺，明确旧脚本接入后置 |
+| 1 | 建立公共组件、新配置、状态及集中 builder 边界 | 单向依赖、配置序列化和组件 shape 契约 |
+| 2 | 实现 single，改造主模型 residual 流和归一化连接 | 无 Engram 路径、attention／FFN 输入、模型最终输出 |
+| 3 | 将 legacy 算法接入五段管线和新状态 | 旧公式逐项审查；仅支持 single；不添加兼容入口 |
+| 4 | 独立实现 GR4，先审查无 Engram 路径 | 分层参数、读写系数、归一化、初始化与最终 mixer |
+| 5 | 独立实现 mHC4，先审查无 Engram 路径 | delayed pre、Sinkhorn 方向、状态寿命及初始化 |
+| 6 | 实现新哈希／存储／读出组件和 Qwen 卷积，组装 Qwen | 逐流门控、表布局、卷积历史和各通道接口 |
+| 7 | 实现参考 token map 与 DeepSeek 预设 | 映射生命周期、哈希依赖、4-gram 及无卷积路径 |
+| 8 | 完成允许的交叉组合和模型使用文档 | 新 API 示例、错误提示、后置验证命令及入口迁移说明 |
 
-- `separate` 为不同 n-gram 阶数保留独立表，适合保持旧结构和教学展示；
-- `packed` 将多个表组织为统一参数或统一索引空间，便于接近论文实现并减少 Python 调度。
+每阶段仅执行本机可用的 AST 解析、`git diff --check` 和静态审查，然后形成独立提交。汇报必须分别列出“已实现”“静态检查结果”“待运行验证”，不能将静态通过表述为算法验收通过。
 
-两者对上层暴露相同的 shape 和语义。容量参数保持本地可运行，不默认复制论文中的完整参数规模。
+## 5. 后置验证与完成标准
 
-### 4.6 readout 与门控
+运行验证统一后置，命令保存在文档中，不新增测试文件或专用验证框架。
 
-读出组件负责把检索向量与当前 hidden state 结合：
+验收覆盖：
 
-- `legacy` 原样迁移当前 MiniGram 的投影、门控和归一化；
-- `signed_sqrt_rms` 实现 Qwen/DeepSeek 共有的 signed-sqrt gate 与 RMS 类归一化；
-- `signed_sqrt_weighted` 在统一门控基础上提供多阶结果的可学习加权。
+- **legacy**：审查旧哈希、门控、归一化及卷积公式；验证新版内部 forward/backward、full/decode 自洽，不验证旧权重加载或跨版本逐元素一致。
+- **通用组件**：separate／packed 在等价表内容下检索一致；非零卷积权重下 full/decode 一致；identity 后处理无卷积参数和历史。
+- **边界与状态**：短序列、各阶 n-gram 起点、EOS、padding/mask、分块 prefill、逐 token decode，以及含重复索引的 beam reorder。
+- **映射与保存恢复**：未就绪映射报错；setter 与新版权重加载后恢复一致；新版配置与权重往返恢复。
+- **通道**：三种通道先独立验证，再与记忆组合；检查参数注册、有限梯度、GR 动态读写、mHC pre 时序、Sinkhorn 行列和及最终归并。
+- **组合**：legacy＋single，以及 Qwen／DeepSeek 与三种通道；检查去卷积、加参考 compression、增加 Qwen 卷积及存储布局切换。legacy＋多通道必须明确拒绝。
+- **训练可执行性**：推荐组合各完成一次 forward、backward 和 optimizer step；覆盖普通 FFN 与现有 MoE 路径。
 
-组件输出 shape 必须一致，使卷积和通道层无需知道具体门控类型。
+FP32 full/decode 比较默认 `atol=1e-5、rtol=1e-4`；哈希 ID 必须完全一致；Sinkhorn 行列和误差不超过 `1e-4`。超出阈值先定位，不自动放宽。其他精度在选定验证环境后单独确认。
 
-### 4.7 后处理
+旧版冻结用于保留历史工程；新版验收只针对新模型契约和所保留的算法机制。模型模块运行验收通过后，再另行规划训练、推理与 checkpoint 脚本接入。
 
-`PostProcessor` 提供两个首发实现：
+## 6. 参考源码快照与定位
 
-- `identity`：直接返回读出结果，对应不使用局部卷积的 DeepSeek 风格配置；
-- `causal_conv`：实现 Qwen 风格的多尺度膨胀因果卷积，并维护增量推理状态。
+以下路径相对仓库根目录，均指向本地参考材料，不是本轮待修改文件。SHA-256 用于检查材料是否变化；它不是上游 Git revision，也不意味着这些参考材料已随本仓库提交。参考材料发生变化时应先核对差异，不自动改用更新版本。
 
-移除卷积时不构造卷积参数，也不创建无用 cache。Qwen 的最大历史窗口由实际 kernel size 和 dilation 推导；若首版参数与论文配置一致，预期需要保留 9 个历史位置，但代码不应写死该数字。
+| 本地文件 | 参考内容 | SHA-256 |
+| --- | --- | --- |
+| `DeepSeek-V4.1-Flash-source/modeling_qwen4_exp.py` | `Qwen4ExpTextRMSNorm`；`Qwen4ExpTextGatedResidual`；`Qwen4ExpTextNGramEmbedding`；`Qwen4ExpTextPLELayer`；decoder／model 的注入、读写和最终 mixer 顺序 | `797a18fd6dd76c574d237a5643759acdeb1c4d0f1c2508693f8fdabce0a19057` |
+| `DeepSeek-V4.1-Flash-source/configuration_qwen4_exp.py` | Qwen 的 n-gram、卷积、GR 参数和结构约束；大模型容量不直接照搬 | `b78132d8cd935437208ee281fa4569b771a63fcb58ebffe84f3e62f5b86235ca` |
+| `DeepSeek-V4.1-Flash-source/inference/engram.py` | `build_compressed_token_map`；`compute_hash_multipliers`；`EngramLayout`；`NgramHashState` | `11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897` |
+| `DeepSeek-V4.1-Flash-source/inference/model.py` | `Engram`；`Block.hc_mixes/hc_pre/hc_post/forward`；`make_identity_pre_mix`；模型的注入和最终归并 | `4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65` |
+| `DeepSeek-V4.1-Flash-source/inference/kernel.py` | `hc_split_sinkhorn_kernel` 和 `hc_split_sinkhorn` 中 pre／post／comb 公式、矩阵方向和迭代顺序；只参考算法，不引入 kernel 依赖 | `1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455` |
 
-### 4.8 插入位置
+legacy 的算法依据是基线提交中的 `model/model_minigram.py`：`EngramModule` 及 `TransformerBlock` 的 Engram 归一化和插入顺序。只继承算法，不继承旧接口契约。
 
-Engram 插入位置是预设的一部分：
+### 6.1 可重跑的静态检查命令
 
-- `legacy` 默认保持当前 MiniGram 的 attention 后插入；
-- `qwen` 和 `deepseek` 默认在 attention 前注入。
+在仓库根目录执行；不导入模型，也不需要 PyTorch：
 
-Transformer 层可以保留一个清晰的结构分支来选择插入阶段，但不得在该分支内实现具体 Engram 算法。构建时将插入阶段解析为枚举或固定 callable，避免每个 token 重复解析字符串。
+```sh
+git diff --check
+python3 - <<'PYTHON'
+import ast
+from pathlib import Path
 
-## 5. 通道插件结构
-
-### 5.1 统一表示
-
-`channels.py` 定义统一的通道载体：
-
-```python
-@dataclass
-class ChannelState:
-    streams: torch.Tensor       # [B, S, R, D]
-    pre_mix: torch.Tensor | None = None
+files = sorted(Path('model').glob('*.py'))
+for path in files:
+    ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+print(f'AST parsed: {len(files)} model files')
+PYTHON
 ```
 
-其中：
+检查冻结引用：
 
-- `B`：batch size；
-- `S`：sequence length；
-- `R`：残差通道数；
-- `D`：hidden size。
-
-attention 和 FFN 仍只接收 `[B, S, D]`。通道插件负责从多个 residual streams 读取单一 hidden state，并把子层输出写回多个 residual streams。
-
-Engram 统一生成 `[B, S, R, D]` 的增量，因此它可以接入三种通道而无需了解通道混合算法。
-
-### 5.2 统一生命周期
-
-每个通道实现提供等价的构建期和运行期接口：
-
-```text
-initialize(hidden) -> ChannelState
-read(state, branch) -> hidden
-write(state, branch_output, branch) -> ChannelState
-inject(state, engram_delta) -> ChannelState
-finalize(state) -> hidden
+```sh
+git rev-parse codex/legacy-v1 minigram-legacy-v1
 ```
 
-`branch` 用于区分 attention、FFN 和必要的 Engram 插入点。具体类可以将 read/write 融合实现，但 Transformer 层看到的调用语义保持一致。
+两行均应为 `2b7125e88906cbe1e1e5dd803f0e1651860c44aa`。后续运行验证命令在模型接口落地后按第 5 节补齐，阶段 0 不将尚不存在的接口示例标记为可运行或已验证。
 
-统一生命周期只约束方法语义，不建立额外的 channel manager、hook 链或基类层次。三个通道类可以直接实现这些方法，共享的小段逻辑使用普通 helper 即可。
+## 7. 阶段进度
 
-### 5.3 single
-
-`SingleResidualChannel` 是兼容基线：
-
-- `R=1`；
-- 初始化、读取、写回和最终输出应退化为当前标准 residual add；
-- 不引入额外可训练参数；
-- 默认配置下必须与迁移前输出逐元素一致。
-
-### 5.4 GR4
-
-`GR4Channel` 首版实现 Qwen 报告中与模型拓扑直接相关的核心机制：
-
-- 四条 residual streams；
-- 每个子层前通过低秩、逐维的可学习映射读出一个 hidden state；
-- attention、FFN 和 Engram 输出通过各自的写入映射回到四条流；
-- 模型末端使用最终 mixer 合并四条流。
-
-GR4 的参数初始化应接近 single residual 的稳定行为，使小模型在接入多通道后可以正常开始训练。所有矩阵和低秩参数属于 channel module，不写入 attention 或 FFN 类。
-
-### 5.5 mHC4
-
-`MHC4Channel` 首版实现 DeepSeek mHC 的核心结构：
-
-- 四条 residual streams；
-- pre、post 和 composition 映射；
-- 使用纯 PyTorch Sinkhorn 迭代把混合矩阵投影到近似双随机矩阵；
-- 维护跨层使用的 carry 或 pre-mix 状态；
-- 最终归并为单一 hidden state。
-
-首版不创建额外 CUDA kernel 文件。纯 PyTorch 版本优先保证公式、梯度和结构清晰，性能优化留给后续独立阶段。
-
-## 6. 配置与构建器
-
-`MiniGramConfig` 新增或整理以下字段：
-
-```python
-use_engrams: bool
-engram_variant: Literal["legacy", "qwen", "deepseek"]
-engram_overrides: dict[str, Any]
-engram_n_layer_list: list[int]
-residual_variant: Literal["single", "gr4", "mhc4"]
-residual_channels: int
-```
-
-现有 Engram 容量、维度和卷积字段继续保留，逐步映射到 `EngramSpec`。配置解析遵循以下顺序：
-
-1. 读取 `engram_variant` 的完整预设；
-2. 应用当前 `MiniGramConfig` 中显式设置的容量参数；
-3. 应用 `engram_overrides`；
-4. 验证组合是否合法；
-5. 一次性构造最终组件。
-
-集中 builder 在构造时直接检查：
-
-- n-gram 阶数非空且递增；
-- memory store 数量与 n-gram 阶数匹配；
-- 卷积只接收它支持的输入布局；
-- `single` 的通道数固定为 1；
-- `gr4` 和 `mhc4` 首版固定为 4；
-- hidden size 可以被需要的 head 或 group 设置整除；
-- compressed mapper 已获得合法 token map。
-
-`model_minigram.py` 只调用类似以下构建器：
-
-```python
-self.channel = build_residual_channel(config)
-self.engrams = build_engram_layers(config)
-```
-
-具体组件选择不散落到 block 的 `forward` 中。
-
-两个 builder 均保持为普通集中函数，不再包装 registry、factory class 或配置解析对象。`engram_overrides` 只接受已知字段的浅层覆盖，不扩展为递归配置合并系统。
-
-## 7. 推理状态与 cache
-
-Engram 使用显式状态对象：
-
-```python
-@dataclass
-class EngramState:
-    hash_tail: torch.Tensor | None
-    post_state: Any | None
-
-    def reorder(self, beam_idx: torch.Tensor) -> "EngramState": ...
-```
-
-- `hash_tail` 保存构造跨 decode step n-gram 所需的最近 token；
-- `post_state` 保存因果卷积等后处理组件的历史；
-- `reorder()` 统一处理 beam search 的 batch 重排。
-
-模型 cache 新接口使用统一的 `engram` 字段。迁移期可以读取旧运行时 cache key，但新输出只生成新格式，避免长期维护两套状态协议。
-
-全序列训练、prefill 和逐 token decode 必须共享同一套组件实现。不得为 decode 复制一份独立哈希或卷积公式。
-
-## 8. 旧权重兼容策略
-
-默认的 `legacy + single` 组合承担兼容责任。
-
-采用 `load_state_dict` pre-hook 或等价的集中映射函数，将旧参数名转换到新模块路径。映射范围包括：
-
-- Engram embedding 表到 `memory_store`；
-- K/V 或门控投影到 `readout`；
-- Engram norm 与 gate bias；
-- 旧卷积参数到 `postprocessor`；
-- 模型级 `norm_engram` 等受拆分影响的名称。
-
-兼容层只负责旧名称迁移，不猜测 qwen 或 deepseek 预设。旧 checkpoint 未携带新配置字段时，明确使用 `legacy + single`。
-
-迁移完成后应保留原有公共 import 路径。若项目外部代码从 `model_minigram.py` 导入旧 Engram 类，则在主文件中提供重导出别名，并在注释中标明兼容用途。
-
-## 9. 分阶段迁移步骤
-
-### 阶段 0：建立可比较基线
-
-在可用的 PyTorch 环境中，用固定 seed、tiny config、`dropout=0` 记录：
-
-- 当前 `state_dict` key 与 shape；
-- 固定 input ids 的 logits；
-- Engram 中间输出；
-- prefill 后逐 token decode 的输出和 cache 结构；
-- 有无 Engram 时的模型参数量。
-
-这些结果作为重构期间的兼容基线。当前 shell 若没有 PyTorch，应先记录环境限制，并在项目已有训练环境中完成该步骤，不能用静态检查代替数值基线。基线通过现有脚本或一次性命令记录，不新增测试文件、fixture 或需要长期维护的基线框架。
-
-### 阶段 1：原样抽取 legacy Engram
-
-1. 新建 `model/engram.py`。
-2. 将现有 Engram 相关类和 helper 原样移动进去。
-3. 在 `model_minigram.py` 保留兼容导入。
-4. 不改变公式、参数名映射、调用顺序和 cache 语义。
-5. 对照阶段 0 验证 logits 与中间输出。
-
-这一阶段只改变代码位置，为后续插件边界建立可信基线。
-
-### 阶段 2：引入统一 Engram 管线
-
-1. 定义 `EngramSpec`、五类组件的统一调用约定和一个集中 builder，不增加协议类层次。
-2. 直接复用旧实现并接入 `legacy` 预设；必要的 shape 转换就地完成，不增加独立 adapter 类。
-3. 将 Engram 输出统一成 `[B, S, R, D]`。
-4. 引入 `EngramState`，同时保留旧 cache 的读取兼容。
-5. 再次验证 `legacy + single` 的数值等价性。
-
-### 阶段 3：引入通道 seam
-
-1. 新建 `model/channels.py`。
-2. 定义 `ChannelState` 和统一生命周期。
-3. 实现 `SingleResidualChannel`。
-4. 把 Transformer 层中的 residual add 改为通道 API 调用。
-5. 验证默认模型仍逐元素等价。
-
-这是风险最高的结构接缝，应在实现 GR4/mHC4 之前单独完成和验证。
-
-### 阶段 4：实现 Qwen + GR4
-
-1. 实现 identity token mapper、rolling/XOR hasher 和相应 memory store。
-2. 实现 signed-sqrt readout。
-3. 实现多尺度膨胀 causal convolution 及增量状态。
-4. 定义 `qwen` 预设。
-5. 实现 `GR4Channel` 和初始化策略。
-6. 验证 `qwen + gr4` 的训练、prefill 和 decode。
-
-### 阶段 5：实现 DeepSeek + mHC4
-
-1. 实现 compressed token mapper 与持久化 token map。
-2. 增加 4-gram 配置及 DeepSeek 默认 readout/postprocessor。
-3. 定义 `deepseek` 预设。
-4. 实现 `MHC4Channel`、Sinkhorn 和 carry 状态。
-5. 验证 `deepseek + mhc4` 的训练、prefill 和 decode。
-
-### 阶段 6：开放消融组合
-
-至少验证以下非默认组合，确认插件边界真实有效：
-
-- Qwen 预设去掉卷积；
-- Qwen 预设加入 token compression；
-- DeepSeek 预设加入 Qwen 风格卷积；
-- legacy memory store 搭配 signed-sqrt readout；
-- Qwen Engram 搭配 single 或 mHC4；
-- DeepSeek Engram 搭配 single 或 GR4。
-
-这些组合直接通过配置构建和运行，不实现组合注册表、参数矩阵 runner 或额外的消融框架。
-
-## 10. 验证计划与完成标准
-
-本节是实现完成后的行为验收清单，不要求为每一项编写自动化测试。实施期间不新增或修改 `tests/` 下的文件；可以运行现有测试，并用不提交到仓库的一次性命令完成必要的 forward、backward、prefill 和 decode 检查。
-
-### 10.1 legacy 兼容
-
-- 旧 `.pth` 可以用兼容入口严格加载；
-- 固定输入 logits 与迁移前一致；
-- Engram 中间结果一致；
-- prefill 与逐 token decode 一致；
-- cache reorder 在 beam 索引下正确；
-- 无 Engram 配置继续正常工作。
-
-### 10.2 三类 Engram
-
-- `legacy`、`qwen`、`deepseek` 均完成 shape、forward、backward 检查；
-- 每个 mapper/hasher/store/readout/postprocessor 可以独立实例化；
-- full-sequence hash 与 step decode hash 一致；
-- padding、BOS、短序列和最大 n-gram 边界正确；
-- token map 随 checkpoint 保存和恢复；
-- `identity` postprocessor 不产生卷积参数或卷积 cache；
-- causal conv 全序列与增量输出一致；
-- Qwen 默认卷积历史长度由配置正确推导。
-
-### 10.3 三类通道
-
-- `single` 与原 residual add 数值一致；
-- GR4 和 mHC4 输出 shape、梯度和参数注册正确；
-- attention 与 FFN 始终只接收 `[B, S, D]`；
-- Engram 注入始终使用 `[B, S, R, D]`；
-- mHC Sinkhorn 输出有限，行和列都接近 1；
-- channel state 和 Engram state 可以随 beam 一起 reorder。
-
-### 10.4 组合与工程质量
-
-- 三个推荐组合可以完成一次前向、反向和 optimizer step；
-- 阶段 6 的消融组合均可构建和运行；
-- 配置非法时给出指向具体组件的错误信息；
-- `model_minigram.py` 不包含 token compression、哈希、Sinkhorn 或卷积缓存的具体公式；
-- 最终模型文件数量保持为三个，不因单个组件继续扩张；
-- README 或示例脚本能用最少配置切换三套展示。
-
-## 11. 实施约束与后续工作
-
-本次迁移遵循以下约束：
-
-- 优先使用清晰的纯 PyTorch 实现；
-- 保持现有项目直写式代码风格，优先合并短小 wrapper，避免为了形式统一增加只做转发的类；
-- 插件化边界以“可替换且调用语义稳定”为准，不追求通用框架、第三方扩展能力或运行时动态装配；
-- 不为了论文参数规模牺牲本地可运行性；
-- 不在本阶段修改数据管线、训练循环、优化器或 GRPO 逻辑；
-- 不在本阶段加入自定义 CUDA/Triton kernel；
-- 不新增或修改测试代码，验证使用现有检查和临时运行命令；
-- 不将 Qwen 与 DeepSeek 的全部训练配方误归为 Engram 组件的一部分；
-- 每个迁移阶段独立提交并可回退，先保证 legacy 等价，再增加新机制。
-
-后续可以在核心结构稳定后单独规划：
-
-1. Muon 或其他优化器组合；
-2. GRPO 阶段冻结 Engram 的实验策略；
-3. 稀疏或分布式超大 memory table；
-4. mHC/GR4 的融合 kernel 和性能优化；
-5. 与论文规模更接近的训练复现实验。
-
-## 12. 推荐提交序列
-
-为降低破坏性修改风险，同时避免把迁移拆成过多框架性步骤，实际编码时建议按以下提交边界推进：
-
-1. `refactor: move legacy engram implementation into module`
-2. `refactor: add compact engram pipeline and state`
-3. `refactor: route residual flow through channel interface`
-4. `feat: add qwen engram preset and gr4 channel`
-5. `feat: add deepseek engram preset and mhc4 channel`
-6. `docs: document engram presets and model assembly`
-
-阶段 0 的基线记录不单独形成测试提交，消融组合验证随对应功能提交完成，也不建立独立测试提交。每个提交都应保持项目可导入，并运行当时已有的检查。若某阶段的数值兼容失败，应在进入下一阶段前解决，避免把结构迁移和新算法误差叠加在一起。
+- **阶段 0 已落实**：建立本地冻结分支与 tag；以方案 B 替换旧计划；记录新接口、支持范围、参考指纹与静态检查命令。模型实现未修改。
+- **阶段 1～8 未开始**：需用户明确确认下一阶段后继续；每阶段完成后更新本节。
+- **运行验证全部待执行**：当前没有算法、数值、梯度、保存恢复或增量推理通过的结论。
