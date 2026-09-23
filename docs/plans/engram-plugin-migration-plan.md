@@ -355,3 +355,12 @@ model = MiniGramForCausalLM(config)
 主模型配置入口调用模型配置及组合校验，Engram resolver 在解析依赖默认值前后分别调用对应配置校验。forward 入口集中检查 cache 容器、层数及 use_cache；beam reorder 入口复用同一函数。删除 EngramState 的具体类检查，内部直接按状态接口访问字段和 reorder 方法。
 
 本次为职责迁移及具体类检查删除，不宣称迁移校验代码减少了总体代码量。算法分支、未实现组件的显式错误和通道 delta 形状约束不变。按交付约定，不执行编码后审查、静态检查或运行验证，不推进阶段 4。
+
+
+## 12. 阶段 4：GR4 编码交付
+
+GR4 已接入现有通道接口。每层 attention／FFN 分别注册 GRMixer，末端单独注册无写回投影的 final_mixer。按 Qwen 参考使用分组零中心 RMSNorm、低秩 SiLU 读门、逐维 sigmoid 读系数及跨流 mean；写系数为 `2 * sigmoid(proj(normalized) / 4)`。attention／FFN 接收 `[B,S,D]`，不再叠加 single 的 RMSNorm，末端 mixer 后也不追加 norm。
+
+GR 线性参数按 initializer_range 正态初始化，零中心 norm 权重为零；顶层 post_init 后通过通道统一初始化入口恢复。关闭 Engram 时可选择 gr4；legacy＋gr4 仍拒绝，Qwen／DeepSeek 尚未接入。
+
+本次与阶段 5 连续施工，分别本地提交；沿用直接编码交付约定，不执行编码后审查、静态检查或模型运行验证。动态读写、参数注册、梯度、初始化、full/decode 及普通 FFN／MoE 路径仍待运行验证。

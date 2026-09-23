@@ -370,6 +370,7 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         self.model.token_embedding.weight = self.lm_head.weight
         self.use_cache = config.use_cache
         self.post_init()
+        self.model.channel.reset_special_parameters()
         for engram in self.model.engrams.values():
             engram.reset_special_parameters()
     

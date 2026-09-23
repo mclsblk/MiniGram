@@ -16,8 +16,9 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
-from .common import RMSNorm
+from .common import RMSNorm, QwenRMSNorm
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class SingleResidualChannel(nn.Module):
         ])
         self.final_norm = RMSNorm(hidden_size)
 
+    def reset_special_parameters(self):
+        pass
+
     def initialize(self, hidden):
         return ChannelState(hidden.unsqueeze(2))
 
@@ -75,11 +79,83 @@ class SingleResidualChannel(nn.Module):
         return self.final_norm(state.streams.squeeze(2))
 
 
+class GRMixer(nn.Module):
+    """Qwen grouped norm, per-feature read gates and per-stream write gates."""
+
+    def __init__(self, hidden_size, rank, initializer_range, use_combine=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.initializer_range = initializer_range
+        self.norm = QwenRMSNorm(4 * hidden_size, group_size=hidden_size)
+        self.read_down = nn.Linear(4 * hidden_size, rank, bias=False)
+        self.read_up = nn.Linear(rank, 4 * hidden_size, bias=False)
+        self.write_proj = nn.Linear(4 * hidden_size, 4, bias=False) if use_combine else None
+        self.reset_special_parameters()
+
+    @torch.no_grad()
+    def reset_special_parameters(self):
+        self.norm.weight.zero_()
+        nn.init.normal_(self.read_down.weight, std=self.initializer_range)
+        nn.init.normal_(self.read_up.weight, std=self.initializer_range)
+        if self.write_proj is not None:
+            nn.init.normal_(self.write_proj.weight, std=self.initializer_range)
+
+    def forward(self, streams):
+        normalized = self.norm(streams.flatten(-2))
+        read_mix = torch.sigmoid(self.read_up(F.silu(self.read_down(normalized) / 4)))
+        hidden = (read_mix * normalized).unflatten(-1, (4, self.hidden_size)).mean(-2)
+        post_mix = None if self.write_proj is None else 2 * torch.sigmoid(self.write_proj(normalized) / 4)
+        return hidden, post_mix
+
+
+class GRResidualChannel(nn.Module):
+    def __init__(self, hidden_size, num_layers, rank, initializer_range):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.ModuleDict({
+                name: GRMixer(hidden_size, rank, initializer_range)
+                for name in ("attention", "ffn")
+            }) for _ in range(num_layers)
+        ])
+        self.final_mixer = GRMixer(hidden_size, rank, initializer_range, use_combine=False)
+
+    def reset_special_parameters(self):
+        for branches in self.branches:
+            for mixer in branches.values():
+                mixer.reset_special_parameters()
+        self.final_mixer.reset_special_parameters()
+
+    def initialize(self, hidden):
+        return ChannelState(hidden.unsqueeze(2).expand(-1, -1, 4, -1))
+
+    def read(self, state, branch):
+        layer_index, kind = branch
+        hidden, post_mix = self.branches[layer_index][kind](state.streams)
+        return hidden, BranchContext(post_mix=post_mix)
+
+    def write(self, state, branch_output, context):
+        return ChannelState(state.streams + context.post_mix.unsqueeze(-1) * branch_output.unsqueeze(2))
+
+    def inject(self, state, delta):
+        if delta.shape != state.streams.shape:
+            raise ValueError("Engram delta must have the same [B,S,R,D] shape as streams")
+        return ChannelState(state.streams + delta)
+
+    def finalize(self, state):
+        hidden, _ = self.final_mixer(state.streams)
+        return hidden
+
+
 def build_residual_channel(config) -> nn.Module:
     """Sole construction entry; never silently fall back to single."""
     if config.residual_variant == "single":
         return SingleResidualChannel(config.hidden_size, config.num_hidden_layers)
+    if config.residual_variant == "gr4":
+        return GRResidualChannel(
+            config.hidden_size, config.num_hidden_layers,
+            config.residual_low_rank, config.initializer_range,
+        )
     raise NotImplementedError(
         f"Residual channel {config.residual_variant!r} is configured but not implemented yet; "
-        "gr4 and mhc4 arrive in stages 4 and 5 respectively"
+        "mhc4 arrives in stage 5"
     )
