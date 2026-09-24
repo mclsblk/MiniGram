@@ -443,3 +443,56 @@ config = MiniGramConfig(
 后置运行命令可复用第 13 节，将 residual_variant 循环增加 single，并设置 use_engrams=True、engram_variant="qwen"。除 forward／backward／optimizer step 外，仍须按第 5 节验证：哈希 ID 完全一致；含 EOS、短序列和 padding 的 full／分块／decode；非零卷积权重下 FP32 输出容差 atol=1e-5、rtol=1e-4；重复 beam 索引；同表内容的 separate／packed；identity 无卷积参数及历史；三通道普通 FFN／MoE 和新版权重保存恢复。
 
 本次按直接交付约定不进行编码后审查、AST 解析、git diff --check 或数值验证。参考文件在施工前核对 SHA-256，与第 6 节一致；这不是实现验收。未 push，未推进阶段 7。
+
+
+## 15. 阶段 7：DeepSeek 与 token compression 编码交付
+
+经用户确认，缺失历史使用模型 `config.pad_token_id`，不新增 setter 参数或 overrides 默认值。映射准备前必须设置该字段；缺失时 setter 明确报错。DeepSeek 默认仍是 compressed＋deepseek_xor＋packed＋deepseek_signed_sqrt＋identity，开启 Engram 后可先构造模型，但映射未就绪的 forward 明确报错，不降级为 identity。
+
+### 15.1 离线映射与持久化
+
+`model.engram.build_compressed_token_map(tokenizer)` 沿用参考 tokenizer 文本归一化：NFKC、NFD、去重音、小写、空白合并与首尾处理，并用私用字符保留单空格 token；含 Unicode replacement character 的部分 UTF-8 token 按原 token 形式分组。返回完整 lookup 和压缩词表大小，不引入语料统计算法。helper 按需使用现有环境的 tokenizers，本轮未安装依赖。
+
+模型级 `set_engram_token_map(token_map)` 接收该 helper 的整数映射，校验长度、连续压缩 ID 和 config.pad_token_id 后，同步配置各层查表、压缩词表大小、压缩 pad ID 及哈希乘数。校验集中在 validation.py，仍不引用具体模型类。setter 不是自定义映射实验 API；文档只支持参考 helper 的结果。
+
+每个 compressed mapper 使用长度等于 config.vocab_size 的持久化 long buffer，尚未准备时为 -1，压缩词表大小为 0。各 hasher 的乘数、容量和 DeepSeek pad ID 也持久化为固定形状 buffer。新配置配套的新版权重可直接恢复，不需要再次读取 tokenizer 或根据变长 buffer 修改加载逻辑。首次 forward 后拒绝用 setter 更换映射；更换 tokenizer／加载另一套映射权重应创建新模型，不复用已有 decode 历史。
+
+Qwen＋compression 的 hash multipliers 和 EOS ID 同步进入压缩域，并持久化恢复。未压缩的 Qwen／legacy 路径不需要 setter。
+
+### 15.2 DeepSeek 公式
+
+DeepSeekHasher 默认计算 2／3／4-gram。乘数按参考 `np.random.default_rng(10007 * layer_id)` 生成奇数，边界由压缩词表大小确定；不以 PyTorch RNG 替代 NumPy，避免地址变化。各层各阶各 head 使用不重复质数容量，默认 packed 不预留零号 padding bucket。
+
+短序列缺失历史和 mask=False 的 token 按参考用压缩 pad ID 填充；mask=False 以 DEAD=-1 保存到历史，并阻断更早回看。EOS 不单独截断。历史最多保留 max(ngram_orders)-1 项；full、分块和 decode 使用相同逐 lookback XOR 公式。
+
+DeepSeekReadout 使用联合 key/value 投影和各 stream 的逐维 q_weight／k_weight，按参考在 FP32 中计算独立 RMS 统计、点积和 copysign signed-sqrt，再 sigmoid 门控共享 value。返回 delta，由通道执行一次残差写回；mask=False 关闭当前门控。默认 identity 不创建卷积参数或 post_state，q/k 初始化在顶层初始化后恢复为 1。
+
+### 15.3 新接口示例与待验证
+
+```python
+from model.engram import build_compressed_token_map
+from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
+
+# tokenizer 已由调用方准备；这里不改变训练／推理脚本。
+config = MiniGramConfig(
+    vocab_size=len(tokenizer),
+    pad_token_id=tokenizer.pad_token_id,  # 必须有明确值
+    use_engrams=True,
+    engram_variant="deepseek",
+    residual_variant="single",  # 也支持 gr4、mhc4
+)
+model = MiniGramForCausalLM(config)
+token_map, compressed_vocab_size = build_compressed_token_map(tokenizer)
+model.set_engram_token_map(token_map)
+
+# 后置验证命令片段：在选定验证环境执行，不是本轮执行结果。
+model.save_pretrained("/tmp/minigram-stage7")
+restored = MiniGramForCausalLM.from_pretrained("/tmp/minigram-stage7")
+# restored 无需重新执行 tokenizer helper 或 setter。
+```
+
+当前三预设均已编码接入；legacy 仍仅允许 single，Qwen／DeepSeek 可接三种通道。现有 overrides 可组合已实现组件，组合覆盖与入口使用文档仍属于阶段 8。此前各阶段记录中 DeepSeek 未实现的描述为历史状态，由本节替代。
+
+待验证范围包括：未准备映射报错、pad_token_id 缺失报错、setter 与保存恢复一致、首次 forward 后 setter 拒绝更新、mask／短序列／4-gram 的哈希 ID、full／分块／decode、重复 beam reorder，以及三通道下普通 FFN／MoE 的梯度与 optimizer step。输出阈值沿用第 5 节，不放宽。
+
+本次仅编码交付，未进行编码后审查、AST 解析、git diff --check 或模型数值验证。施工前参考指纹与第 6 节一致。本轮不安装依赖，不修改训练／推理脚本，不 push，不推进阶段 8。

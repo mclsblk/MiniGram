@@ -4,8 +4,8 @@
 
 Both streams and delta use [B, S, R, D]. Memory heads are ordered by ascending
 n-gram order, then head index. Hashers produce head-local bucket IDs; stores
-alone translate them to packed offsets. Legacy and Qwen are implemented;
-DeepSeek lands in stage 7. Presets never silently substitute for one another.
+alone translate them to packed offsets. Legacy, Qwen and DeepSeek retain their
+respective boundary and normalization formulas.
 """
 
 from dataclasses import asdict, dataclass, fields
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from .common import RMSNorm, QwenRMSNorm
 from .validation import (
-    validate_engram_selection, validate_engram_options, validate_engram_parameters,
+    validate_engram_selection, validate_engram_options, validate_engram_parameters, validate_token_map,
 )
 
 
@@ -94,6 +94,23 @@ class EngramState:
 class IdentityTokenMapper(nn.Module):
     def forward(self, input_ids):
         return input_ids.long()
+
+
+class CompressedTokenMapper(nn.Module):
+    """Persistent fixed-size lookup; no tokenizer work in model forward."""
+
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.register_buffer("token_map", torch.full((vocab_size,), -1, dtype=torch.long))
+        self.register_buffer("compressed_vocab_size", torch.tensor(0, dtype=torch.long))
+        self.started = False
+
+    def forward(self, input_ids):
+        if not self.started:
+            if self.compressed_vocab_size.item() == 0:
+                raise RuntimeError("Engram token map is not ready; call set_engram_token_map or load prepared weights")
+            self.started = True
+        return self.token_map[input_ids.long()]
 
 
 class LegacyHasher(nn.Module):
@@ -197,7 +214,7 @@ class LegacyReadout(nn.Module):
         self.gate_bias = nn.Parameter(torch.tensor(-4.0))
         self.scale = hidden_size ** -0.5
 
-    def forward(self, memory, streams):
+    def forward(self, memory, streams, token_mask=None):
         key = self.key_norm(self.key_proj(memory)).unsqueeze(2)
         value = self.value_norm(self.value_proj(memory)).unsqueeze(2)
         logits = (self.query_norm(streams) * key).sum(dim=-1, keepdim=True) * self.scale
@@ -286,7 +303,8 @@ class QwenHasher(nn.Module):
         self.orders = spec.ngram_orders
         self.num_heads = spec.num_heads
         self.tail_size = max(self.orders) - 1
-        self.eos_token_id = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
+        eos = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
+        self.register_buffer("eos_token_id", torch.tensor(eos, dtype=torch.long))
         total_heads = len(self.orders) * self.num_heads
         first_head = memory_layer_index * total_heads
         prime = _find_nth_prime_after(spec.bucket_size - 1, first_head + 1)
@@ -314,12 +332,12 @@ class QwenHasher(nn.Module):
         gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
         shifted = token_ids.gather(dim=1, index=gather_positions)
         valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
-        return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
+        return torch.where(valid, shifted, self.eos_token_id)
 
     def forward(self, token_ids, tail=None, token_mask=None):
         batch, length = token_ids.shape
         if tail is None:
-            tail = token_ids.new_full((batch, self.tail_size), self.eos_token_id)
+            tail = self.eos_token_id.expand(batch, self.tail_size)
         context = torch.cat((tail.to(token_ids), token_ids), dim=1)
         shifted = [self._shift_right_ignore_eos(context, shift) for shift in range(self.tail_size + 1)]
         blocks = []
@@ -345,7 +363,7 @@ class QwenReadout(nn.Module):
         self.key_norm = QwenRMSNorm(streams * hidden_size, group_size=hidden_size)
         self.query_norm = QwenRMSNorm(streams * hidden_size, group_size=hidden_size)
 
-    def forward(self, memory, streams):
+    def forward(self, memory, streams, token_mask=None):
         key = self.key_norm(self.key_proj(memory)).unflatten(-1, (self.streams, self.hidden_size))
         query = self.query_norm(streams.flatten(-2)).unflatten(-1, (self.streams, self.hidden_size))
         logits = (key * query).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
@@ -382,6 +400,133 @@ class QwenCausalConv(nn.Module):
         return values + convolved, tail.clone()
 
 
+def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
+    """Map every token id onto a smaller id space where tokens that normalize alike collapse together.
+
+    N-grams are hashed over these compressed ids, so " The", "the" and "THE" all hash the same way.
+    Returns the lookup plus the size of the compressed vocab -- and that size matters beyond bounds
+    checking, because every hash multiplier is derived from it.
+    """
+    from tokenizers import Regex, normalizers
+
+    # a private-use char, so a token that is exactly one space survives Strip() instead of
+    # collapsing to the empty string and merging with unrelated tokens
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence(
+        [
+            normalizers.NFKC(),
+            normalizers.NFD(),
+            normalizers.StripAccents(),
+            normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
+            normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(),
+            normalizers.Replace(sentinel, " "),
+        ]
+    )
+
+    # the raw Rust tokenizer, matching what training decodes with (no clean_up_tokenization_spaces)
+    backend = tokenizer.backend_tokenizer
+    key_to_new: dict[str, int] = {}
+    lookup = [0] * len(tokenizer)
+    for token_id in range(len(tokenizer)):
+        text = backend.decode([token_id], skip_special_tokens=False)
+        if "\ufffd" in text:
+            # a partial UTF-8 byte token: nothing to normalize, so key it by its raw form
+            key = backend.id_to_token(token_id)
+        else:
+            normalized = normalizer.normalize_str(text)
+            key = normalized if normalized else text
+
+        new_id = key_to_new.get(key)
+        if new_id is None:
+            new_id = len(key_to_new)
+            key_to_new[key] = new_id
+        lookup[token_id] = new_id
+
+    return lookup, len(key_to_new)
+
+
+class DeepSeekHasher(nn.Module):
+    """Compressed token history; DEAD blocks all earlier lookbacks, including across calls."""
+
+    def __init__(self, spec, layer_id, memory_layer_index):
+        super().__init__()
+        self.layer_id = layer_id
+        self.orders = spec.ngram_orders
+        self.num_heads = spec.num_heads
+        self.tail_size = max(self.orders) - 1
+        count = len(self.orders) * self.num_heads
+        prime = _find_nth_prime_after(spec.bucket_size - 1, memory_layer_index * count + 1)
+        sizes = [prime]
+        for _ in range(count - 1):
+            prime = _find_nth_prime_after(prime, 1)
+            sizes.append(prime)
+        self.bucket_sizes = tuple(sizes)
+        self.register_buffer("head_capacities", torch.tensor(sizes, dtype=torch.long))
+        self.register_buffer("multipliers", torch.zeros(self.tail_size + 1, dtype=torch.long))
+        self.register_buffer("pad_id", torch.tensor(-1, dtype=torch.long))
+
+    def prepare_mapping(self, compressed_vocab_size, compressed_pad_id):
+        # NumPy's reference RNG is intentional: torch RNG produces different addresses.
+        import numpy as np
+        bound = max(1, ((2**63 - 1) // compressed_vocab_size) // 2)
+        generator = np.random.default_rng(10007 * self.layer_id)
+        values = generator.integers(0, bound, size=self.tail_size + 1, dtype=np.int64)
+        self.multipliers.copy_(torch.as_tensor(values * 2 + 1, device=self.multipliers.device))
+        self.pad_id.fill_(compressed_pad_id)
+
+    def forward(self, token_ids, tail=None, token_mask=None):
+        if self.pad_id.item() < 0:
+            raise RuntimeError("DeepSeek hash mapping is not ready; prepare the token map with config.pad_token_id set")
+        if token_mask is not None:
+            token_ids = token_ids.masked_fill(~token_mask.bool(), -1)
+        batch, length = token_ids.shape
+        tail = token_ids.new_empty(batch, 0) if tail is None else tail.to(token_ids)
+        context = torch.cat((tail, token_ids), dim=1)
+        positions = torch.arange(tail.size(1), context.size(1), device=token_ids.device).expand(batch, length)
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
+        rolling = torch.zeros_like(positions)
+        hashes = []
+        order_index = 0
+        for shift in range(self.tail_size + 1):
+            source = context.gather(1, (positions - shift).clamp_min(0))
+            blocked = blocked | (positions < shift) | (source == -1)
+            tokens = torch.where(blocked, self.pad_id, source)
+            rolling = torch.bitwise_xor(rolling, tokens * self.multipliers[shift])
+            if shift + 1 in self.orders:
+                capacities = self.head_capacities[order_index * self.num_heads:(order_index + 1) * self.num_heads]
+                hashes.append(torch.remainder(rolling.unsqueeze(-1), capacities))
+                order_index += 1
+        return torch.cat(hashes, dim=-1), context[:, -self.tail_size:].clone()
+
+
+class DeepSeekReadout(nn.Module):
+    """Reference FP32 gate with separate per-dimension q/k weights."""
+
+    def __init__(self, memory_dim, hidden_size, streams):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.streams = streams
+        self.wkv = nn.Linear(memory_dim, hidden_size * (streams + 1), bias=False)
+        self.q_weight = nn.Parameter(torch.ones(streams, hidden_size))
+        self.k_weight = nn.Parameter(torch.ones(streams, hidden_size))
+        self.eps = 1e-6
+
+    def forward(self, memory, streams, token_mask=None):
+        key, value = self.wkv(memory).split([self.streams * self.hidden_size, self.hidden_size], dim=-1)
+        key = key.float().unflatten(-1, (self.streams, self.hidden_size))
+        hidden = streams.float()
+        weight = self.q_weight.float() * self.k_weight.float()
+        rstd = torch.rsqrt(hidden.square().mean(-1) + self.eps)
+        rstd = rstd * torch.rsqrt(key.square().mean(-1) + self.eps)
+        dot = (hidden * weight * key).sum(-1) * rstd * self.hidden_size ** -0.5
+        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        if token_mask is not None:
+            gate = gate.masked_fill(~token_mask.bool().unsqueeze(-1), 0)
+        return (gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(streams.dtype)
+
+
 class EngramLayer(nn.Module):
     def __init__(self, spec, token_mapper, hasher, memory_store, readout, postprocessor):
         super().__init__()
@@ -397,7 +542,7 @@ class EngramLayer(nn.Module):
         mapped = self.token_mapper(input_ids)
         bucket_ids, hash_tail = self.hasher(mapped, state.hash_tail, token_mask)
         memory = self.memory_store(bucket_ids)
-        gated = self.readout(memory, streams)
+        gated = self.readout(memory, streams, token_mask)
         delta, post_state = self.postprocessor(gated, state.post_state, token_mask)
         return delta, EngramState(hash_tail, post_state)
 
@@ -410,33 +555,66 @@ class EngramLayer(nn.Module):
         for module in self.modules():
             if isinstance(module, QwenRMSNorm):
                 nn.init.zeros_(module.weight)
+        if isinstance(self.readout, DeepSeekReadout):
+            nn.init.ones_(self.readout.q_weight)
+            nn.init.ones_(self.readout.k_weight)
+
+
+@torch.no_grad()
+def set_engram_token_map(layers, config, token_map):
+    """Install the offline reference lookup and synchronize dependent hash metadata."""
+    targets = [layer for layer in layers.values() if isinstance(layer.token_mapper, CompressedTokenMapper)]
+    if not targets:
+        raise ValueError("No compressed Engram token mapper is enabled")
+    lookup = torch.as_tensor(token_map, dtype=torch.long)
+    validate_token_map(lookup, config.vocab_size, config.pad_token_id,
+                       any(layer.token_mapper.started for layer in targets))
+    compressed_size = int(lookup.max().item()) + 1
+    pad_id = int(lookup[config.pad_token_id].item())
+    for memory_layer_index, layer in enumerate(targets):
+        hasher = layer.hasher
+        if isinstance(hasher, DeepSeekHasher):
+            hasher.prepare_mapping(compressed_size, pad_id)
+        elif isinstance(hasher, QwenHasher):
+            multipliers = _build_layer_multipliers(
+                compressed_size, hasher.tail_size + 1, memory_layer_index,
+                config.engram_overrides["hash_seed"],
+            )
+            hasher.multipliers.copy_(multipliers.to(hasher.multipliers.device))
+            eos = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
+            hasher.eos_token_id.copy_(lookup[eos].to(hasher.eos_token_id))
+        mapper = layer.token_mapper
+        mapper.token_map.copy_(lookup.to(mapper.token_map))
+        mapper.compressed_vocab_size.fill_(compressed_size)
 
 
 def build_engram_layers(config) -> nn.ModuleDict:
-    """Assemble independent memory layers from implemented components."""
+    """Assemble independent memory layers; compressed mappings can be prepared later."""
     if not config.use_engrams:
         return nn.ModuleDict()
-    if config.engram_variant == "deepseek":
-        raise NotImplementedError("DeepSeek Engram arrives in stage 7")
     spec = EngramSpec(**config.engram_overrides)
-    supported = {"token_mapper": ("identity",), "hasher": ("legacy", "qwen_xor"),
-                 "readout": ("legacy", "qwen_signed_sqrt"),
-                 "postprocessor": ("identity", "legacy_conv", "causal_conv")}
-    for name, choices in supported.items():
-        if getattr(spec, name) not in choices:
-            raise NotImplementedError(f"Engram component {name}={getattr(spec, name)!r} is not implemented yet")
     store_class = {"separate": SeparateMemoryStore, "packed": PackedMemoryStore}[spec.memory_store]
     layers = nn.ModuleDict()
     for memory_layer_index, layer_id in enumerate(config.engram_n_layer_list):
+        mapper = (CompressedTokenMapper(config.vocab_size) if spec.token_mapper == "compressed"
+                  else IdentityTokenMapper())
+        padding_idx = None
         if spec.hasher == "legacy":
             hasher = LegacyHasher(spec, layer_id)
             padding_idx = 0
-        else:
+        elif spec.hasher == "qwen_xor":
             hasher = QwenHasher(spec, config.vocab_size, config.eos_token_id, memory_layer_index)
-            padding_idx = None
+        else:
+            hasher = DeepSeekHasher(spec, layer_id, memory_layer_index)
+            if spec.token_mapper == "identity" and config.pad_token_id is not None:
+                hasher.prepare_mapping(config.vocab_size, config.pad_token_id)
         memory_dim = len(hasher.bucket_sizes) * spec.head_dim
-        readout = (LegacyReadout(memory_dim, config.hidden_size) if spec.readout == "legacy"
-                   else QwenReadout(memory_dim, config.hidden_size, config.residual_channels))
+        if spec.readout == "legacy":
+            readout = LegacyReadout(memory_dim, config.hidden_size)
+        elif spec.readout == "qwen_signed_sqrt":
+            readout = QwenReadout(memory_dim, config.hidden_size, config.residual_channels)
+        else:
+            readout = DeepSeekReadout(memory_dim, config.hidden_size, config.residual_channels)
         if spec.postprocessor == "legacy_conv":
             postprocessor = LegacyCausalConv(config.hidden_size, spec.conv_kernel_size)
         elif spec.postprocessor == "causal_conv":
@@ -446,7 +624,7 @@ def build_engram_layers(config) -> nn.ModuleDict:
         else:
             postprocessor = IdentityPostProcessor()
         layers[str(layer_id)] = EngramLayer(
-            spec, IdentityTokenMapper(), hasher,
+            spec, mapper, hasher,
             store_class(hasher.bucket_sizes, spec.head_dim, padding_idx=padding_idx),
             readout, postprocessor,
         )

@@ -5,7 +5,7 @@ import torch
 import math
 
 from .channels import build_residual_channel
-from .engram import build_engram_layers, resolve_engram_spec
+from .engram import build_engram_layers, resolve_engram_spec, set_engram_token_map
 from .validation import (
     validate_model_config, validate_engram_combination, validate_past_key_values,
 )
@@ -333,6 +333,9 @@ class MiniGramModel(nn.Module):
         self.register_buffer("precompute_freqs_cos", cos, persistent=False)
         self.register_buffer("precompute_freqs_sin", sin, persistent=False)
     
+    def set_engram_token_map(self, token_map):
+        set_engram_token_map(self.engrams, self.config, token_map)
+
     def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None):
         hidden_states = self.token_embedding(input_ids)
         state = self.channel.initialize(hidden_states)
@@ -374,6 +377,9 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         for engram in self.model.engrams.values():
             engram.reset_special_parameters()
     
+    def set_engram_token_map(self, token_map):
+        self.model.set_engram_token_map(token_map)
+
     def forward(self, input_ids=None, attention_mask=None, use_cache=None,
                 past_key_values=None, labels=None, logits_to_keep=0, **kwargs):
         use_cache = self.use_cache if use_cache is None else use_cache

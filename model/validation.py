@@ -101,3 +101,17 @@ def validate_past_key_values(past_key_values, num_layers, use_cache=True):
         attn = cache.get("attn")
         if attn is not None and (not isinstance(attn, tuple) or len(attn) != 2):
             raise TypeError("The 'attn' cache entry must be a (key, value) tuple")
+
+
+def validate_token_map(token_map, vocab_size, pad_token_id, started):
+    if started:
+        raise RuntimeError("Engram token map cannot change after the first forward")
+    if pad_token_id is None:
+        raise ValueError("Set config.pad_token_id before preparing the Engram token map")
+    if not 0 <= pad_token_id < vocab_size:
+        raise ValueError("config.pad_token_id must index the model vocabulary")
+    if token_map.ndim != 1 or token_map.numel() != vocab_size:
+        raise ValueError("Engram token map must contain one entry per model vocabulary token")
+    ids = token_map.unique(sorted=True)
+    if ids.numel() == 0 or ids[0].item() != 0 or ids[-1].item() != ids.numel() - 1:
+        raise ValueError("Compressed token IDs must be contiguous from zero")
