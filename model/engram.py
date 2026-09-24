@@ -4,8 +4,8 @@
 
 Both streams and delta use [B, S, R, D]. Memory heads are ordered by ascending
 n-gram order, then head index. Hashers produce head-local bucket IDs; stores
-alone translate them to packed offsets. Qwen and DeepSeek land in stages 6
-and 7; the builder must never substitute one preset for another.
+alone translate them to packed offsets. Legacy and Qwen are implemented;
+DeepSeek lands in stage 7. Presets never silently substitute for one another.
 """
 
 from dataclasses import asdict, dataclass, fields
@@ -15,7 +15,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .common import RMSNorm
+from .common import RMSNorm, QwenRMSNorm
 from .validation import (
     validate_engram_selection, validate_engram_options, validate_engram_parameters,
 )
@@ -232,6 +232,156 @@ class LegacyCausalConv(nn.Module):
         return values + convolved[:, -length:].unsqueeze(2), tail.unsqueeze(2).clone()
 
 
+_MASK64 = (1 << 64) - 1
+_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+_SPLITMIX_M1 = 0xBF58476D1CE4E5B9
+_SPLITMIX_M2 = 0x94D049BB133111EB
+_PRIME_1 = 10007
+
+
+def _splitmix64(value: int) -> int:
+    value = (value + _SPLITMIX_GAMMA) & _MASK64
+    value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
+    value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
+    return (value ^ (value >> 31)) & _MASK64
+
+
+def _build_layer_multipliers(unigram_vocab_size, ngram_size, ple_layer_index, seed: int) -> torch.Tensor:
+    max_long = (1 << 63) - 1
+    multiplier_max = max_long // max(unigram_vocab_size, 1)
+    half_bound = max(1, multiplier_max // 2)
+    base_seed = seed + _PRIME_1 * ple_layer_index
+    multipliers = []
+    for index in range(ngram_size):
+        value = (base_seed + _SPLITMIX_GAMMA * (index + 1)) & _MASK64
+        multipliers.append(2 * (_splitmix64(value) % half_bound) + 1)
+    return torch.tensor(multipliers, dtype=torch.long)
+
+
+def _is_prime(value: int) -> bool:
+    if value < 2:
+        return False
+    if value % 2 == 0:
+        return value == 2
+    for divisor in range(3, math.isqrt(value) + 1, 2):
+        if value % divisor == 0:
+            return False
+    return True
+
+
+def _find_nth_prime_after(start: int, count: int) -> int:
+    prime = start
+    for _ in range(count):
+        prime += 1
+        while not _is_prime(prime):
+            prime += 1
+    return prime
+
+
+class QwenHasher(nn.Module):
+    """Reference EOS-delimited XOR hashes with a distinct prime per memory head."""
+
+    def __init__(self, spec, vocab_size, eos_token_id, memory_layer_index):
+        super().__init__()
+        self.orders = spec.ngram_orders
+        self.num_heads = spec.num_heads
+        self.tail_size = max(self.orders) - 1
+        self.eos_token_id = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
+        total_heads = len(self.orders) * self.num_heads
+        first_head = memory_layer_index * total_heads
+        prime = _find_nth_prime_after(spec.bucket_size - 1, first_head + 1)
+        sizes = [prime]
+        for _ in range(total_heads - 1):
+            prime = _find_nth_prime_after(prime, 1)
+            sizes.append(prime)
+        self.bucket_sizes = tuple(sizes)
+        self.register_buffer("head_capacities", torch.tensor(sizes, dtype=torch.long))
+        self.register_buffer("multipliers", _build_layer_multipliers(
+            vocab_size, max(self.orders), memory_layer_index, spec.hash_seed,
+        ))
+
+    def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
+        if shift == 0:
+            return token_ids
+        batch_size, seq_len = token_ids.shape
+        positions = torch.arange(seq_len, device=token_ids.device, dtype=torch.long)
+        eos_positions = torch.where(token_ids == self.eos_token_id, positions, -1)
+        previous_eos_inclusive = torch.cummax(eos_positions, dim=1).values
+        previous_eos = torch.cat([eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]], dim=1)
+        segment_start = previous_eos + 1
+        position_in_segment = positions.unsqueeze(0) - segment_start
+        source_positions = positions - shift
+        gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
+        shifted = token_ids.gather(dim=1, index=gather_positions)
+        valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
+        return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
+
+    def forward(self, token_ids, tail=None, token_mask=None):
+        batch, length = token_ids.shape
+        if tail is None:
+            tail = token_ids.new_full((batch, self.tail_size), self.eos_token_id)
+        context = torch.cat((tail.to(token_ids), token_ids), dim=1)
+        shifted = [self._shift_right_ignore_eos(context, shift) for shift in range(self.tail_size + 1)]
+        blocks = []
+        for index, order in enumerate(self.orders):
+            mixed = shifted[0] * self.multipliers[0]
+            for position in range(1, order):
+                mixed = torch.bitwise_xor(mixed, shifted[position] * self.multipliers[position])
+            capacities = self.head_capacities[index * self.num_heads:(index + 1) * self.num_heads]
+            blocks.append(torch.remainder(mixed.unsqueeze(-1), capacities))
+        hashes = torch.cat(blocks, dim=-1)[:, tail.size(1):tail.size(1) + length]
+        return hashes, context[:, -self.tail_size:].clone()
+
+
+class QwenReadout(nn.Module):
+    """One normalized key per stream, shared value, reference signed-sqrt gate."""
+
+    def __init__(self, memory_dim, hidden_size, streams):
+        super().__init__()
+        self.streams = streams
+        self.hidden_size = hidden_size
+        self.key_proj = nn.Linear(memory_dim, streams * hidden_size, bias=False)
+        self.value_proj = nn.Linear(memory_dim, hidden_size, bias=False)
+        self.key_norm = QwenRMSNorm(streams * hidden_size, group_size=hidden_size)
+        self.query_norm = QwenRMSNorm(streams * hidden_size, group_size=hidden_size)
+
+    def forward(self, memory, streams):
+        key = self.key_norm(self.key_proj(memory)).unflatten(-1, (self.streams, self.hidden_size))
+        query = self.query_norm(streams.flatten(-2)).unflatten(-1, (self.streams, self.hidden_size))
+        logits = (key * query).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+        logits = logits.abs().clamp_min(1e-6).sqrt() * logits.sign()
+        return torch.sigmoid(logits) * self.value_proj(memory).unsqueeze(-2)
+
+
+class QwenCausalConv(nn.Module):
+    """Gated residual + SiLU(depthwise causal conv(group-norm(gated residual)))."""
+
+    def __init__(self, hidden_size, streams, kernel_size, dilation):
+        super().__init__()
+        self.tail_size = (kernel_size - 1) * dilation
+        width = streams * hidden_size
+        self.norm = QwenRMSNorm(width, group_size=hidden_size)
+        self.conv = nn.Conv1d(width, width, kernel_size, groups=width, dilation=dilation, bias=False)
+        nn.init.zeros_(self.conv.weight)
+
+    def forward(self, values, state=None, token_mask=None):
+        batch, length, streams, width = values.shape
+        normalized = self.norm(values.flatten(-2)).unflatten(-1, (streams, width))
+        if token_mask is not None:
+            mask = token_mask[:, :, None, None].to(values)
+            values = values * mask
+            normalized = normalized * mask
+        state = values.new_empty(batch, 0, streams, width) if state is None else state.to(values)
+        if length == 0:
+            return values, state
+        source = torch.cat((state, normalized), dim=1)
+        padded = F.pad(source.flatten(-2).transpose(1, 2), (self.tail_size, 0))
+        convolved = F.silu(self.conv(padded[..., -(self.tail_size + length):]))
+        convolved = convolved.transpose(1, 2).unflatten(-1, (streams, width))
+        tail = source[:, -self.tail_size:] if self.tail_size else source[:, :0]
+        return values + convolved, tail.clone()
+
+
 class EngramLayer(nn.Module):
     def __init__(self, spec, token_mapper, hasher, memory_store, readout, postprocessor):
         super().__init__()
@@ -255,36 +405,49 @@ class EngramLayer(nn.Module):
     def reset_special_parameters(self):
         """Preserve padding and zero-convolution initialization after HF post_init."""
         self.memory_store.reset_padding()
-        if isinstance(self.postprocessor, LegacyCausalConv):
+        if isinstance(self.postprocessor, (LegacyCausalConv, QwenCausalConv)):
             nn.init.zeros_(self.postprocessor.conv.weight)
+        for module in self.modules():
+            if isinstance(module, QwenRMSNorm):
+                nn.init.zeros_(module.weight)
 
 
 def build_engram_layers(config) -> nn.ModuleDict:
-    """Build independent layer-index-keyed modules; disabled memory is empty.
-
-    Only legacy components are available at this stage. Component substitutions
-    that need Qwen/DeepSeek never silently use a legacy implementation instead.
-    """
+    """Assemble independent memory layers from implemented components."""
     if not config.use_engrams:
         return nn.ModuleDict()
-    if config.engram_variant != "legacy":
-        raise NotImplementedError(f"Engram preset {config.engram_variant!r} arrives in stages 6/7")
-    # MiniGramConfig already resolved defaults and validated the combination.
+    if config.engram_variant == "deepseek":
+        raise NotImplementedError("DeepSeek Engram arrives in stage 7")
     spec = EngramSpec(**config.engram_overrides)
-    supported = {"token_mapper": ("identity",), "hasher": ("legacy",),
-                 "readout": ("legacy",), "postprocessor": ("identity", "legacy_conv")}
+    supported = {"token_mapper": ("identity",), "hasher": ("legacy", "qwen_xor"),
+                 "readout": ("legacy", "qwen_signed_sqrt"),
+                 "postprocessor": ("identity", "legacy_conv", "causal_conv")}
     for name, choices in supported.items():
         if getattr(spec, name) not in choices:
             raise NotImplementedError(f"Engram component {name}={getattr(spec, name)!r} is not implemented yet")
     store_class = {"separate": SeparateMemoryStore, "packed": PackedMemoryStore}[spec.memory_store]
     layers = nn.ModuleDict()
-    for layer_id in config.engram_n_layer_list:
-        hasher = LegacyHasher(spec, layer_id)
-        postprocessor = (LegacyCausalConv(config.hidden_size, spec.conv_kernel_size)
-                         if spec.postprocessor == "legacy_conv" else IdentityPostProcessor())
+    for memory_layer_index, layer_id in enumerate(config.engram_n_layer_list):
+        if spec.hasher == "legacy":
+            hasher = LegacyHasher(spec, layer_id)
+            padding_idx = 0
+        else:
+            hasher = QwenHasher(spec, config.vocab_size, config.eos_token_id, memory_layer_index)
+            padding_idx = None
+        memory_dim = len(hasher.bucket_sizes) * spec.head_dim
+        readout = (LegacyReadout(memory_dim, config.hidden_size) if spec.readout == "legacy"
+                   else QwenReadout(memory_dim, config.hidden_size, config.residual_channels))
+        if spec.postprocessor == "legacy_conv":
+            postprocessor = LegacyCausalConv(config.hidden_size, spec.conv_kernel_size)
+        elif spec.postprocessor == "causal_conv":
+            postprocessor = QwenCausalConv(
+                config.hidden_size, config.residual_channels, spec.conv_kernel_size, spec.conv_dilation,
+            )
+        else:
+            postprocessor = IdentityPostProcessor()
         layers[str(layer_id)] = EngramLayer(
             spec, IdentityTokenMapper(), hasher,
-            store_class(hasher.bucket_sizes, spec.head_dim, padding_idx=0),
-            LegacyReadout(len(hasher.bucket_sizes) * spec.head_dim, config.hidden_size), postprocessor,
+            store_class(hasher.bucket_sizes, spec.head_dim, padding_idx=padding_idx),
+            readout, postprocessor,
         )
     return layers

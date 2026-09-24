@@ -404,3 +404,42 @@ PYCODE
 ```
 
 本阶段仅编码交付，未进行编码后审查、AST 解析、git diff --check 或运行验证；数值与算法验收尚未完成。未修改训练／推理脚本、依赖或测试文件，未推进阶段 6。
+
+
+## 14. 阶段 6：Qwen Engram 编码交付
+
+Qwen 预设已组装进五段管线，支持 single、GR4、mHC4，默认 packed，允许切换 separate 或使用 identity 去除卷积。本阶段仅修改 engram.py 与本文档，未修改通道、主模型、训练／推理入口或依赖；DeepSeek 及 compression 仍留待阶段 7。
+
+### 14.1 哈希与存储
+
+QwenHasher 按本地参考 `_build_layer_multipliers`、`_splitmix64` 和 `_shift_right_ignore_eos` 的公式生成哈希。缺失前缀用 EOS 补齐，EOS 后的 token 不读取上一段；EOS 自身仍能读取它之前的同段 token。多 EOS 配置按参考使用列表首项。padding mask 不重写 token ID 或重置哈希历史。
+
+head 顺序为 n-gram 阶数再 head 索引。各 head 容量按 bucket 基数起的连续质数分配；全局 head 序号和 multiplier seed 使用排序后的 Engram 插入列表内序号，而非模型绝对层号。实际容量和 multipliers 保存为 buffer。Qwen 不预留零号 padding bucket；legacy 继续保留。packed offset 是各 head 容量的前缀和，separate 使用同一组容量；不额外分配参考大模型用于 embedding 对齐的尾部空行，也不提供跨布局权重转换器。
+
+哈希状态保存最多 max(ngram_orders)-1 个原 token。full、分块 prefill 和 decode 均调用同一个 shift／XOR 过程；没有单独 decode 近似公式。
+
+### 14.2 逐流读取与卷积
+
+QwenReadout 将记忆投影到逐流 key 和共享 value，query/key 按流使用 Qwen 零中心 RMSNorm。每条流独立执行点积、除 sqrt(D)、signed-sqrt（abs clamp 至 1e-6）和 sigmoid；不压缩 streams，也不额外增加多阶输出权重。
+
+QwenCausalConv 保留 norm → depthwise causal conv → SiLU，再加回原门控值的顺序。默认 kernel=4、dilation=3，历史长度为 `(kernel-1)*dilation`，默认 9；缓存为已归一化且应用 mask 的 `[B,T,R,D]` 卷积输入。mask 同时作用于门控残差与卷积输入；按参考不再对卷积输出补 mask，EOS 不重置卷积。卷积采用统一左 padding／切片公式处理所有调用长度。
+
+identity 后处理不创建卷积参数或历史；也不额外引入 Qwen 卷积组件的 mask 操作。顶层特殊初始化入口恢复 Qwen norm 的零权重与卷积零权重，不改变其他线性层的初始化。
+
+### 14.3 使用与后置验证
+
+```python
+config = MiniGramConfig(
+    use_engrams=True,
+    engram_variant="qwen",
+    residual_variant="gr4",  # 也可使用 single 或 mhc4
+    engram_n_layer_list=[1],
+)
+# 可选覆盖：{"memory_store": "separate"} 或 {"postprocessor": "identity"}
+```
+
+当前可编码构造的组合为 legacy＋single、Qwen＋single／GR4／mHC4；默认 engram_variant 仍为 deepseek，启用时暂须显式选择 legacy 或 qwen。本节替代前面交付记录中 Qwen 未实现的历史状态。
+
+后置运行命令可复用第 13 节，将 residual_variant 循环增加 single，并设置 use_engrams=True、engram_variant="qwen"。除 forward／backward／optimizer step 外，仍须按第 5 节验证：哈希 ID 完全一致；含 EOS、短序列和 padding 的 full／分块／decode；非零卷积权重下 FP32 输出容差 atol=1e-5、rtol=1e-4；重复 beam 索引；同表内容的 separate／packed；identity 无卷积参数及历史；三通道普通 FFN／MoE 和新版权重保存恢复。
+
+本次按直接交付约定不进行编码后审查、AST 解析、git diff --check 或数值验证。参考文件在施工前核对 SHA-256，与第 6 节一致；这不是实现验收。未 push，未推进阶段 7。
