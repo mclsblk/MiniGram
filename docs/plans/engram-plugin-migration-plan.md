@@ -496,3 +496,12 @@ restored = MiniGramForCausalLM.from_pretrained("/tmp/minigram-stage7")
 待验证范围包括：未准备映射报错、pad_token_id 缺失报错、setter 与保存恢复一致、首次 forward 后 setter 拒绝更新、mask／短序列／4-gram 的哈希 ID、full／分块／decode、重复 beam reorder，以及三通道下普通 FFN／MoE 的梯度与 optimizer step。输出阈值沿用第 5 节，不放宽。
 
 本次仅编码交付，未进行编码后审查、AST 解析、git diff --check 或模型数值验证。施工前参考指纹与第 6 节一致。本轮不安装依赖，不修改训练／推理脚本，不 push，不推进阶段 8。
+
+
+## 16. Token compression 文件拆分
+
+按用户要求只调整代码归属，新增 `model/token_compression.py`，存放参考 tokenizer 归一化 helper、CompressedTokenMapper、映射准备与 buffer 写入。Engram 调用该模块，继续负责不同 hasher 的乘数与 EOS／pad 信息同步及管线组装；哈希公式不迁入 compression 文件。
+
+依赖固定为主模型 → engram → token_compression → validation。token_compression 不导入主模型、Engram 或通道类。`build_compressed_token_map` 可从新文件导入，原 `model.engram` 导入路径通过直接导入同一函数保留，不新增 wrapper。模型级 setter 签名、buffer 名称及 state_dict 路径、映射生命周期和数值公式均不变。
+
+本次为结构拆分，未进行编码后审查、静态检查或数值验证，不将行为保持的实现意图表述为验证通过。未修改训练／推理脚本，未 push，未推进阶段 8。

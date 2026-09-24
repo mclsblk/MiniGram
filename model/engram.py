@@ -16,8 +16,11 @@ from torch import nn
 import torch.nn.functional as F
 
 from .common import RMSNorm, QwenRMSNorm
+from .token_compression import (
+    CompressedTokenMapper, build_compressed_token_map, prepare_token_map,
+)
 from .validation import (
-    validate_engram_selection, validate_engram_options, validate_engram_parameters, validate_token_map,
+    validate_engram_selection, validate_engram_options, validate_engram_parameters,
 )
 
 
@@ -94,23 +97,6 @@ class EngramState:
 class IdentityTokenMapper(nn.Module):
     def forward(self, input_ids):
         return input_ids.long()
-
-
-class CompressedTokenMapper(nn.Module):
-    """Persistent fixed-size lookup; no tokenizer work in model forward."""
-
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.register_buffer("token_map", torch.full((vocab_size,), -1, dtype=torch.long))
-        self.register_buffer("compressed_vocab_size", torch.tensor(0, dtype=torch.long))
-        self.started = False
-
-    def forward(self, input_ids):
-        if not self.started:
-            if self.compressed_vocab_size.item() == 0:
-                raise RuntimeError("Engram token map is not ready; call set_engram_token_map or load prepared weights")
-            self.started = True
-        return self.token_map[input_ids.long()]
 
 
 class LegacyHasher(nn.Module):
@@ -400,53 +386,6 @@ class QwenCausalConv(nn.Module):
         return values + convolved, tail.clone()
 
 
-def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
-    """Map every token id onto a smaller id space where tokens that normalize alike collapse together.
-
-    N-grams are hashed over these compressed ids, so " The", "the" and "THE" all hash the same way.
-    Returns the lookup plus the size of the compressed vocab -- and that size matters beyond bounds
-    checking, because every hash multiplier is derived from it.
-    """
-    from tokenizers import Regex, normalizers
-
-    # a private-use char, so a token that is exactly one space survives Strip() instead of
-    # collapsing to the empty string and merging with unrelated tokens
-    sentinel = "\ue000"
-    normalizer = normalizers.Sequence(
-        [
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(),
-            normalizers.Replace(sentinel, " "),
-        ]
-    )
-
-    # the raw Rust tokenizer, matching what training decodes with (no clean_up_tokenization_spaces)
-    backend = tokenizer.backend_tokenizer
-    key_to_new: dict[str, int] = {}
-    lookup = [0] * len(tokenizer)
-    for token_id in range(len(tokenizer)):
-        text = backend.decode([token_id], skip_special_tokens=False)
-        if "\ufffd" in text:
-            # a partial UTF-8 byte token: nothing to normalize, so key it by its raw form
-            key = backend.id_to_token(token_id)
-        else:
-            normalized = normalizer.normalize_str(text)
-            key = normalized if normalized else text
-
-        new_id = key_to_new.get(key)
-        if new_id is None:
-            new_id = len(key_to_new)
-            key_to_new[key] = new_id
-        lookup[token_id] = new_id
-
-    return lookup, len(key_to_new)
-
-
 class DeepSeekHasher(nn.Module):
     """Compressed token history; DEAD blocks all earlier lookbacks, including across calls."""
 
@@ -566,11 +505,10 @@ def set_engram_token_map(layers, config, token_map):
     targets = [layer for layer in layers.values() if isinstance(layer.token_mapper, CompressedTokenMapper)]
     if not targets:
         raise ValueError("No compressed Engram token mapper is enabled")
-    lookup = torch.as_tensor(token_map, dtype=torch.long)
-    validate_token_map(lookup, config.vocab_size, config.pad_token_id,
-                       any(layer.token_mapper.started for layer in targets))
-    compressed_size = int(lookup.max().item()) + 1
-    pad_id = int(lookup[config.pad_token_id].item())
+    lookup, compressed_size, pad_id = prepare_token_map(
+        token_map, config.vocab_size, config.pad_token_id,
+        [layer.token_mapper for layer in targets],
+    )
     for memory_layer_index, layer in enumerate(targets):
         hasher = layer.hasher
         if isinstance(hasher, DeepSeekHasher):
@@ -583,9 +521,7 @@ def set_engram_token_map(layers, config, token_map):
             hasher.multipliers.copy_(multipliers.to(hasher.multipliers.device))
             eos = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
             hasher.eos_token_id.copy_(lookup[eos].to(hasher.eos_token_id))
-        mapper = layer.token_mapper
-        mapper.token_map.copy_(lookup.to(mapper.token_map))
-        mapper.compressed_vocab_size.fill_(compressed_size)
+        layer.token_mapper.set_mapping(lookup, compressed_size)
 
 
 def build_engram_layers(config) -> nn.ModuleDict:
