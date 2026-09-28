@@ -1,4 +1,6 @@
+import json
 import math
+from pathlib import Path
 import os
 import random
 from contextlib import nullcontext
@@ -9,6 +11,8 @@ import torch
 from transformers import AutoTokenizer
 from model.model_minigram import MiniGramConfig, MiniGramForCausalLM
 from trainer.ddp_utils import unwrap_model
+from trainer.config_utils import MODEL_FIELDS
+from model.token_compression import CompressedTokenMapper, build_compressed_token_map
 
 
 def set_seed(seed: int, deterministic: bool = False) -> None:
@@ -17,11 +21,8 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    else:
-        torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 def get_lr(step, total_steps, base_lr, warmup_steps, min_lr) -> float:
     if total_steps <= 0:
@@ -64,11 +65,6 @@ def log(msg: str) -> None:
     print(f"[{now}] {msg}", flush=True)
 
 
-def format_eta(seconds: float) -> str:
-    minutes = max(0.0, float(seconds)) / 60.0
-    return f"{minutes:.2f}min"
-
-
 def get_remaining_time(global_step: int, total_steps: int, start_step: int, start_time: float) -> float:
     used_steps = max(1, global_step - start_step)
     used_time = (datetime.now() - datetime.fromtimestamp(start_time)).total_seconds()
@@ -78,21 +74,7 @@ def get_remaining_time(global_step: int, total_steps: int, start_step: int, star
 
 def log_train_metrics(prefix: str, metrics: dict, lr: float, eta_seconds: float) -> None:
     metric_text = " ".join(f"{key}={value:.4f}" for key, value in metrics.items())
-    log(f"{prefix} {metric_text} lr={lr:.7f} eta={format_eta(eta_seconds)}")
-
-
-def _unwrap_model(model):
-    return unwrap_model(model)
-
-
-def _cpu_state_dict(state_dict, dtype=None):
-    payload = {}
-    for key, value in state_dict.items():
-        tensor = value.detach()
-        if dtype is not None and tensor.is_floating_point():
-            tensor = tensor.to(dtype=dtype)
-        payload[key] = tensor.cpu()
-    return payload
+    log(f"{prefix} {metric_text} lr={lr:.7f} eta={max(0.0, eta_seconds) / 60:.2f}min")
 
 
 def _human_count(n: int) -> str:
@@ -106,7 +88,7 @@ def _human_count(n: int) -> str:
 
 
 def get_param(model):
-    raw_model = _unwrap_model(model)
+    raw_model = unwrap_model(model)
     total_params = sum(p.numel() for p in raw_model.parameters())
     trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
 
@@ -118,74 +100,79 @@ def get_param(model):
     }
 
 
-def init_model(args, device, device_type, checkpoint_path=None, use_cache=False, map_location="cpu"):
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+def load_tokenizer(source):
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("Tokenizer must define PAD or EOS")
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is None or tokenizer.eos_token_id is None:
+        raise ValueError("Tokenizer must define BOS and EOS")
+    return tokenizer
 
-    lm_config = MiniGramConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
-        use_engrams=bool(args.use_engrams),
-        use_cache=use_cache,
-        flash_attention=True if device_type == "cuda" else False,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        engram_vocab_size=args.engram_vocab_size if args.use_engrams else None,
-        use_moe=bool(getattr(args, "use_moe", 0)),
+
+def build_model_config(model_options, tokenizer):
+    unknown = set(model_options) - set(MODEL_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown model fields: {sorted(unknown)}")
+    config = MiniGramConfig(
+        **model_options, vocab_size=len(tokenizer), pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
+        use_cache=False,
     )
-    model = MiniGramForCausalLM(lm_config).to(device)
-
-    if checkpoint_path is not None:
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        load_checkpoint(checkpoint_path, model, optimizer=None, map_location=map_location)
-
-    return model, tokenizer
-
-
-def save_checkpoint(path, model, name, optimizer, step, model_dtype=torch.float16):
-    save_dir = os.path.join(path, "checkpoint")
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"{name}.pth")
-    raw_model = _unwrap_model(model)
-    model_state = _cpu_state_dict(raw_model.state_dict(), dtype=model_dtype)
-    payload = {
-        "model": model_state,
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
-        "step": step,
-    }
-    tmp_path = save_path + ".tmp"
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, save_path)
+    if config.hidden_size % config.num_attention_heads:
+        raise ValueError("model.hidden_size: must be divisible by model.num_attention_heads")
+    if config.num_attention_heads % config.num_kv_heads:
+        raise ValueError("model.num_attention_heads: must be divisible by model.num_kv_heads")
+    if (config.hidden_size // config.num_attention_heads) % 2:
+        raise ValueError("model.hidden_size: attention head dimension must be even for RoPE")
+    if not 1 <= config.num_expert_per_token <= config.num_experts:
+        raise ValueError("model.num_expert_per_token: must be between 1 and model.num_experts")
+    return config
 
 
-def save_model_only(path, model, name, dtype=torch.float16):
-    save_dir = path or "."
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"{name}.pth")
-    raw_model = _unwrap_model(model)
-    payload = _cpu_state_dict(raw_model.state_dict(), dtype=dtype)
-    tmp_path = save_path + ".tmp"
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, save_path)
+def create_model(config, tokenizer, prepare_mapping=True):
+    model = MiniGramForCausalLM(config)
+    if prepare_mapping and any(isinstance(layer.token_mapper, CompressedTokenMapper)
+           for layer in model.model.engrams.values()):
+        if not hasattr(tokenizer, "backend_tokenizer"):
+            raise ValueError("Compressed Engram requires a fast tokenizer with backend_tokenizer")
+        token_map, _ = build_compressed_token_map(tokenizer)
+        model.set_engram_token_map(token_map)
+    return model
 
 
-def load_checkpoint(path, model, optimizer=None, map_location="cpu") -> dict:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
-    state = torch.load(path, map_location=map_location)
-    raw_model = _unwrap_model(model)
+def save_checkpoint(path, model, optimizer=None, scaler=None, step=None, train_config=None):
+    """One .pth file; omit optimizer for a model-only export."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = unwrap_model(model)
+    state = {"config": raw.config.to_dict(),
+             "model": {k: v.detach().cpu() for k, v in raw.state_dict().items()}}
+    if optimizer is not None:
+        state.update(optimizer=optimizer.state_dict(), scaler=scaler.state_dict() if scaler is not None else None,
+                     step=step, train_config=train_config)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        raw_model.load_state_dict(state["model"], strict=True)
-    except:
-        raw_model.load_state_dict(state, strict=False)
+        torch.save(state, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    if optimizer is not None and state.get("optimizer") is not None:
+
+def load_checkpoint(path, model, optimizer=None, scaler=None):
+    """Strictly load matching new-model weights, optionally restoring training state."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    raw = unwrap_model(model)
+    if not isinstance(state, dict) or not {"config", "model"} <= state.keys():
+        raise ValueError("Expected a .pth containing config and model; old weights are unsupported")
+    if json.loads(json.dumps(state["config"])) != json.loads(json.dumps(raw.config.to_dict())):
+        raise ValueError("Checkpoint model config mismatch")
+    if optimizer is not None and not {"optimizer", "scaler", "step", "train_config"} <= state.keys():
+        raise ValueError("Resuming requires a training checkpoint, not a model-only export")
+    raw.load_state_dict(state["model"], strict=True)
+    if optimizer is not None:
         optimizer.load_state_dict(state["optimizer"])
-    
-    step = state.get("step", {})
-    epoch = step.get("epoch", 0)
-    epoch_step = step.get("epoch_step", 0)
-    return state, epoch, epoch_step
+        if scaler is not None and state["scaler"] is not None:
+            scaler.load_state_dict(state["scaler"])
+    return state

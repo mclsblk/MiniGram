@@ -46,6 +46,9 @@ class MiniGramConfig(PretrainedConfig):
         self.num_attention_heads = kwargs.get("num_attention_heads", 8)
         self.num_kv_heads = kwargs.get("num_kv_heads", 4)
         self.intermediate_size = kwargs.get("intermediate_size", None)
+        if self.intermediate_size is None:
+            intermediate_size = int(hidden_size * 8 / 3)
+            self.intermediate_size = 64 * ((intermediate_size + 63) // 64)
         self.hidden_act = kwargs.get("hidden_act", "silu")
         self.initializer_range = kwargs.get("initializer_range", 0.02)
         self.use_cache = kwargs.get("use_cache", True)
@@ -225,9 +228,6 @@ class SimpleAttention(nn.Module):
 class FFN(nn.Module): 
     def __init__(self, config: MiniGramConfig):
         super().__init__()
-        if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8 / 3)
-            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -260,7 +260,8 @@ class FFNofMoE(nn.Module):
             if token_indices.numel() > 0:
                 weight = topk_probs[token_indices, topk_slots].unsqueeze(-1)
                 expert_output = expert(x_flat[token_indices]) * weight
-                expert_outputs.index_add_(0, token_indices, expert_output)
+                # Autocast may keep routing weights in FP32 while streams are BF16/FP16.
+                expert_outputs.index_add_(0, token_indices, expert_output.to(expert_outputs.dtype))
             elif self.training:
                 expert_outputs = expert_outputs + 0.0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.loss_coef > 0:

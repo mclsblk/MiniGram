@@ -1,249 +1,198 @@
+"""TOML-driven pretraining. SFT/GRPO migrate to the shared APIs separately."""
 import argparse
+import copy
+import json
 import os
+from pathlib import Path
 import sys
 import time
+from types import SimpleNamespace
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
 
-__package__ = "trainer"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from dataset.data_utils import PretrainDataset
+from trainer.config_utils import apply_cli_overrides, load_train_config, CLI_FIELDS
 from trainer.ddp_utils import (
-    barrier,
-    build_distributed_sampler,
-    build_worker_seed_fn,
-    cleanup_distributed,
-    get_model_dtype,
-    init_distributed,
-    maybe_no_sync,
-    rank0_log,
-    reduce_metrics,
-    set_sampler_epoch,
-    wrap_ddp,
+    barrier, build_distributed_sampler, build_worker_seed_fn, cleanup_distributed,
+    init_distributed, maybe_no_sync, rank0_log, reduce_metrics, set_sampler_epoch, wrap_ddp,
 )
 from trainer.train_utils import (
-    build_amp,
-    get_param,
-    get_lr,
-    get_remaining_time,
-    init_model,
-    load_checkpoint,
-    log,
-    log_train_metrics,
-    save_checkpoint,
-    save_model_only,
-    set_seed,
+    build_amp, build_model_config, create_model, get_lr, get_param, get_remaining_time,
+    load_checkpoint, load_tokenizer, log, log_train_metrics, save_checkpoint, set_seed,
 )
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="MiniGram TOML pretraining")
+    parser.add_argument("--config", required=True, help="Training TOML file")
+    parser.add_argument("--resume_from", help="Training checkpoint .pth file")
+    parser.add_argument("--device", help="Override runtime.device (auto, cpu, cuda:0)")
+    parser.add_argument("--save_dir", help="Override output.save_dir, relative to current directory")
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--learning_rate", type=float)
+    parser.add_argument("--epochs", type=int)
+    return parser.parse_args(argv)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="MiniGram pretraining (single-GPU v1)")
-
-    # data/tokenizer
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t.jsonl", help="Path to JSON/JSONL pretraining data file")
-    parser.add_argument("--tokenizer_path", type=str, default="../model", help="Tokenizer path/name for AutoTokenizer")
-    parser.add_argument("--max_length", type=int, default=340, help="Sequence length")
-
-    # model
-    parser.add_argument("--hidden_size", type=int, default=512)
-    parser.add_argument("--num_hidden_layers", type=int, default=12)
-    parser.add_argument("--use_moe", type=int, default=0, choices=[0, 1], help="Enable Mixture of Experts (MoE) layers")
-    parser.add_argument("--use_engrams", type=int, default=0, choices=[0, 1], help="Enable engram blocks")
-    parser.add_argument("--engram_vocab_size", type=int, default=1024, help="Engram block vocab size (if use_engrams=1)")
-
-    # train
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--min_lr", type=float, default=3e-5)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "bf16", "fp16"])
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_compile", type=int, default=0, choices=[0, 1], help="Enable torch.compile")
-
-    # output/resume
-    parser.add_argument("--save_dir", type=str, default="./out")
-    parser.add_argument("--save_name", type=str, default="minigram_pretrain")
-    parser.add_argument("--save_interval", type=int, default=1000, help="Save every N micro-batches")
-    parser.add_argument("--log_interval", type=int, default=100, help="Log every N micro-batches")
-    parser.add_argument("--resume_from", type=str, default=None, help="Path to .pth checkpoint")
-
-    # runtime
-    parser.add_argument("--device", type=str, default=None, help="Override device, e.g. cuda:0 or cpu")
-
-    return parser.parse_args()
+def validate_progress(progress, steps_per_epoch, epochs, accumulation_steps):
+    fields = ("epoch", "epoch_step", "micro_step", "optimizer_step")
+    if set(progress) != set(fields) or any(type(progress[k]) is not int or progress[k] < 0 for k in fields):
+        raise ValueError("Invalid checkpoint progress")
+    epoch, step = progress["epoch"], progress["epoch_step"]
+    if epoch > epochs or step >= steps_per_epoch or (epoch == epochs and step != 0):
+        raise ValueError("Checkpoint next-batch position is outside the training schedule")
+    if step % accumulation_steps:
+        raise ValueError("Checkpoint is not at an accumulation boundary")
+    if progress["micro_step"] != epoch * steps_per_epoch + step:
+        raise ValueError("Checkpoint micro_step and next-batch position disagree")
+    max_updates = epoch * ((steps_per_epoch + accumulation_steps - 1) // accumulation_steps) + step // accumulation_steps
+    if progress["optimizer_step"] > max_updates:
+        raise ValueError("Checkpoint optimizer_step exceeds completed accumulation windows")
 
 
-def main():
-    args = parse_args()
-
-    ddp_state = init_distributed(args)
-    if ddp_state.is_main:
-        os.makedirs(args.save_dir, exist_ok=True)
-    barrier(ddp_state)
-
+def train(config, resume_from, ddp_state):
+    data, train_cfg, runtime, output = (config[key] for key in ("data", "train", "runtime", "output"))
     device = ddp_state.device
-    device_type = ddp_state.device_type
-    set_seed(args.seed + ddp_state.rank, deterministic=False)
+    info = lambda msg: rank0_log(ddp_state, msg, log)
+    set_seed(train_cfg["seed"] + ddp_state.rank, deterministic=False)
+    info(f"device={device}, dtype={train_cfg['dtype']}, rank={ddp_state.rank}/{ddp_state.world_size}")
+    if device.type != "cuda" and train_cfg["dtype"] != "fp32":
+        info("Non-CUDA execution uses FP32; configured autocast dtype applies only on CUDA.")
+    if device.type == "cuda" and train_cfg["dtype"] == "bf16" and not torch.cuda.is_bf16_supported():
+        raise ValueError("train.dtype=bf16 is unsupported on this CUDA device")
 
-    def log_info(msg):
-        rank0_log(ddp_state, msg, log)
-
-    log_info(
-        f"Using device={device}, dtype={args.dtype}, "
-        f"ddp={ddp_state.enabled}, rank={ddp_state.rank}/{ddp_state.world_size}"
+    tokenizer = load_tokenizer(data.get("tokenizer_path", data.get("tokenizer_name")))
+    model_options = dict(config["model"])
+    # SDPA also supports CPU. Keep the effective model config independent of device overrides.
+    model_options.setdefault("flash_attention", True)
+    lm_config = build_model_config(model_options, tokenizer)
+    resolved = copy.deepcopy(config)
+    resolved["model"] = json.loads(json.dumps(lm_config.to_dict()))
+    dataset = PretrainDataset(data["data_path"], tokenizer, max_length=data["max_length"])
+    sampler = build_distributed_sampler(dataset, ddp_state, shuffle=False, drop_last=False,
+                                        seed=train_cfg["seed"])
+    generator = torch.Generator().manual_seed(train_cfg["seed"] + ddp_state.rank)
+    loader = DataLoader(
+        dataset, batch_size=train_cfg["batch_size"], sampler=sampler, shuffle=False, drop_last=False,
+        num_workers=data["num_workers"], pin_memory=device.type == "cuda",
+        worker_init_fn=build_worker_seed_fn(train_cfg["seed"], ddp_state.rank), generator=generator,
     )
-
-    model, tokenizer = init_model(args, device=device, device_type=device_type, use_cache=False)
-
-    train_ds = PretrainDataset(
-        data_path=args.data_path,
-        tokenizer=tokenizer,
-        max_length=args.max_length
-    )
-    pin_memory = device_type == "cuda"
-    train_sampler = build_distributed_sampler(
-        train_ds,
-        ddp_state,
-        shuffle=False,
-        drop_last=False,
-        seed=args.seed,
-    )
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(args.seed + ddp_state.rank)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        worker_init_fn=build_worker_seed_fn(args.seed, ddp_state.rank),
-        generator=loader_generator,
-    )
-
-    if args.use_compile == 1:
+    steps_per_epoch = len(loader)
+    if not steps_per_epoch:
+        raise ValueError("Training dataloader is empty")
+    total_steps = train_cfg["epochs"] * steps_per_epoch
+    warmup_steps = int(total_steps * train_cfg["warmup_ratio"])
+    accumulation = train_cfg["accumulation_steps"]
+    progress = {"epoch": 0, "epoch_step": 0, "micro_step": 0, "optimizer_step": 0}
+    model = create_model(lm_config, tokenizer, prepare_mapping=not resume_from).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=train_cfg["learning_rate"],
+                            weight_decay=train_cfg["weight_decay"])
+    autocast_ctx, scaler = build_amp(train_cfg["dtype"], device.type)
+    resume_config = {"train": train_cfg, "data": data, "world_size": ddp_state.world_size,
+                     "steps_per_epoch": steps_per_epoch}
+    if resume_from:
+        saved = load_checkpoint(resume_from, model, optimizer, scaler)
+        if saved["train_config"] != resume_config:
+            raise ValueError("Resume training configuration mismatch")
+        progress = saved["step"]
+        validate_progress(progress, steps_per_epoch, train_cfg["epochs"], accumulation)
+        del saved
+        info(f"Resuming at {progress}")
+    if runtime["use_compile"]:
         model = torch.compile(model)
-        log_info("torch.compile enabled")
+        info("torch.compile enabled")
     model = wrap_ddp(model, ddp_state)
-    param_info = get_param(model)
-    log_info(
-        "Model size: "
-        f"total={param_info['total_params_human']} ({param_info['total_params']}) "
-        f"trainable={param_info['trainable_params_human']} ({param_info['trainable_params']}) "
-    )
-
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    autocast_ctx, scaler = build_amp(args.dtype, device_type)
-
-    steps_per_epoch = len(train_loader)
-    total_steps = args.epochs * steps_per_epoch
-    warmup_steps = int(total_steps * args.warmup_ratio)
-
-    start_epoch = 0
-    resume_step = 0
-    global_step = 0
-
-    if args.resume_from:
-        state, start_epoch, resume_step = load_checkpoint(args.resume_from, model, optimizer=optimizer, map_location="cpu")
-        start_epoch = int(state.get("epoch", 0))
-        global_step = start_epoch * steps_per_epoch + resume_step
-        log_info(
-            "Resumed from checkpoint "
-            f"{args.resume_from} (epoch={start_epoch}, global_step={global_step}, epoch_step={resume_step})"
-        )
-
+    info(f"Model parameters: {get_param(model)['total_params_human']}")
+    info("Effective model config: " + json.dumps(resolved["model"], ensure_ascii=False, sort_keys=True))
+    if ddp_state.is_main:
+        Path(output["save_dir"]).mkdir(parents=True, exist_ok=True)
+        (Path(output["save_dir"]) / "resolved_config.json").write_text(
+            json.dumps(resolved, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    global_start = time.time()
+    started_at = time.time()
+    start_micro = progress["micro_step"]
+    start_epoch, start_batch = progress["epoch"], progress["epoch_step"]
+    pending_save = False
 
-    for epoch in range(start_epoch, args.epochs):
-        set_sampler_epoch(train_sampler, epoch)
-        for batch_idx, batch in enumerate(train_loader):
-            if epoch == start_epoch and batch_idx < resume_step:
+    def save():
+        if ddp_state.is_main:
+            filename = output["save_name"] + ".pth"
+            save_checkpoint(Path(output["save_dir"]) / "checkpoint" / filename, model,
+                            optimizer=optimizer, scaler=scaler, step=dict(progress), train_config=resume_config)
+            save_checkpoint(Path(output["save_dir"]) / filename, model)
+
+    for epoch in range(start_epoch, train_cfg["epochs"]):
+        set_sampler_epoch(sampler, epoch)
+        skip = start_batch if epoch == start_epoch else 0
+        for batch_idx, (input_ids, labels) in enumerate(loader):
+            if batch_idx < skip:
                 continue
-
-            global_step += 1
-            lr = get_lr(global_step, total_steps, args.learning_rate, warmup_steps, args.min_lr)
+            progress["micro_step"] += 1
+            micro_step = progress["micro_step"]
+            lr = get_lr(micro_step, total_steps, train_cfg["learning_rate"], warmup_steps, train_cfg["min_lr"])
             for group in optimizer.param_groups:
                 group["lr"] = lr
-
-            input_ids, labels = batch
-            input_ids = input_ids.to(device, non_blocking=pin_memory)
-            labels = labels.to(device, non_blocking=pin_memory)
-
-            should_step = ((batch_idx + 1) % args.accumulation_steps == 0) or (
-                (batch_idx + 1) == len(train_loader)
-            )
+            input_ids = input_ids.to(device, non_blocking=device.type == "cuda")
+            labels = labels.to(device, non_blocking=device.type == "cuda")
+            mask = labels.ne(-100)  # Pretrain only: SFT prompt masking has different semantics.
+            window_start = (batch_idx // accumulation) * accumulation
+            window_size = min(accumulation, steps_per_epoch - window_start)
+            should_step = batch_idx + 1 == window_start + window_size
             with maybe_no_sync(model, ddp_state, should_step):
                 with autocast_ctx():
-                    outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-                    aux_loss = getattr(outputs, "aux_loss", None)
-                    if aux_loss is None:
-                        aux_loss = outputs.loss.new_zeros(())
-                    elif not torch.is_tensor(aux_loss):
-                        aux_loss = outputs.loss.new_tensor(float(aux_loss))
-                    logits_loss = outputs.loss
-                    total_loss = logits_loss + aux_loss
-
-                loss = total_loss / args.accumulation_steps
-                scaler.scale(loss).backward()
-
+                    outputs = model(input_ids=input_ids, labels=labels, attention_mask=mask, use_cache=False)
+                    total_loss = outputs.loss + outputs.aux_loss
+                scaler.scale(total_loss / window_size).backward()
             if should_step:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if train_cfg["grad_clip"] > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
+                previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                if scaler.get_scale() >= previous_scale:
+                    progress["optimizer_step"] += 1
                 optimizer.zero_grad(set_to_none=True)
-
-            logits_loss_value = float(logits_loss.detach().item())
-            aux_loss_value = float(aux_loss.detach().item())
-            total_loss_value = logits_loss_value + aux_loss_value
-
-            if (global_step % args.log_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                reduced_metrics = reduce_metrics(
-                    {
-                        "loss": total_loss_value,
-                        "logits_loss": logits_loss_value,
-                        "aux_loss": aux_loss_value,
-                    },
-                    ddp_state,
-                )
-                remaining_time = get_remaining_time(
-                    global_step=global_step,
-                    total_steps=total_steps,
-                    start_step=(start_epoch * steps_per_epoch) + resume_step,
-                    start_time=global_start,
-                )
+            last_batch = batch_idx + 1 == steps_per_epoch
+            progress["epoch"] = epoch + 1 if last_batch else epoch
+            progress["epoch_step"] = 0 if last_batch else batch_idx + 1
+            if micro_step % output["log_interval"] == 0 or micro_step == total_steps:
+                metrics = reduce_metrics({"loss": total_loss, "logits_loss": outputs.loss,
+                                          "aux_loss": outputs.aux_loss}, ddp_state)
+                eta = get_remaining_time(micro_step, total_steps, start_micro, started_at)
                 if ddp_state.is_main:
-                    log_train_metrics(
-                        prefix=f"epoch[{epoch + 1}/{args.epochs}]({global_step}/{total_steps})",
-                        metrics=reduced_metrics,
-                        lr=lr,
-                        eta_seconds=remaining_time,
-                    )
-
-            if ddp_state.is_main and (global_step % args.save_interval == 0 or global_step == total_steps) and batch_idx > 0:
-                model_dtype = get_model_dtype(model)
-                save_model_only(args.save_dir, model=model, name=args.save_name, dtype=model_dtype)
-                save_checkpoint(args.save_dir, model=model, name=args.save_name, optimizer=optimizer,
-                                step={"epoch": epoch, "epoch_step": batch_idx + 1}, model_dtype=model_dtype)
-            del outputs, loss, logits_loss, aux_loss, total_loss, input_ids, labels
-        log_info(f"Epoch {epoch + 1} complete.")
-    if ddp_state.is_main:
-        save_model_only(args.save_dir, model=model, name=args.save_name, dtype=get_model_dtype(model))
-        log("Training complete.")
+                    log_train_metrics(f"epoch[{epoch + 1}/{train_cfg['epochs']}] micro[{micro_step}/{total_steps}] "
+                                      f"optimizer[{progress['optimizer_step']}]", metrics, lr, eta)
+            pending_save |= micro_step % output["save_interval"] == 0 or micro_step == total_steps
+            if pending_save and should_step:
+                save()
+                pending_save = False
+            del outputs, total_loss, input_ids, labels, mask
+        info(f"Epoch {epoch + 1} complete.")
+    if start_micro == total_steps:
+        save()
     barrier(ddp_state)
-    cleanup_distributed()
+    info("Training complete.")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    overrides = {key: getattr(args, key) for key in CLI_FIELDS}
+    config = apply_cli_overrides(load_train_config(args.config, "pretrain"), overrides)
+    try:
+        requested = config["runtime"]["device"]
+        ddp_state = init_distributed(SimpleNamespace(device=None if requested == "auto" else requested))
+        rank0_log(ddp_state, f"Config: {Path(args.config).expanduser().resolve()}; CLI overrides: "
+                  + json.dumps({k: v for k, v in overrides.items() if v is not None}), log)
+        train(config, args.resume_from, ddp_state)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
