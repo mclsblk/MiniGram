@@ -66,12 +66,16 @@ def _check_fields(values, schema, prefix):
 
 
 def validate_train_config(config, stage="pretrain"):
-    if stage != "pretrain" or config.get("stage") != stage:
+    if stage not in ("pretrain", "sft") or config.get("stage") != stage:
         raise ValueError(f"stage: expected supported stage {stage!r}")
-    unknown = set(config) - {"stage", *SCHEMA}
+    stage_schema = dict(SCHEMA)
+    if stage == "sft":
+        stage_schema.pop("model")
+        stage_schema["data"] = {**SCHEMA["data"], "train_on_prompt": bool}
+    unknown = set(config) - {"stage", *stage_schema}
     if unknown:
         raise ValueError(f"Unknown configuration fields: {sorted(unknown)}")
-    for group, schema in SCHEMA.items():
+    for group, schema in stage_schema.items():
         if group not in config:
             raise ValueError(f"{group}: missing table")
         _check_fields(config[group], schema, group)
@@ -84,7 +88,7 @@ def validate_train_config(config, stage="pretrain"):
         for field in fields:
             if field not in config[group]:
                 raise ValueError(f"{group}.{field}: required")
-    data, model, train = (config[key] for key in ("data", "model", "train"))
+    data, model, train = config["data"], config.get("model", {}), config["train"]
     if ("tokenizer_path" in data) == ("tokenizer_name" in data):
         raise ValueError("data: specify exactly one of tokenizer_path and tokenizer_name")
     if "engram_overrides" in model:
@@ -118,6 +122,8 @@ def validate_train_config(config, stage="pretrain"):
     name = config["output"]["save_name"]
     if name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError("output.save_name: expected a filename, not a path")
+    if stage == "sft":
+        return config
     for field, kind in MODEL_FIELDS.items():
         if kind is int and field in model and model[field] <= 0:
             raise ValueError(f"model.{field}: must be positive")
@@ -137,7 +143,12 @@ def load_train_config(path, stage="pretrain"):
     path = Path(path).expanduser().resolve()
     with path.open("rb") as stream:
         config = tomllib.load(stream)
-    for group, defaults in DEFAULTS.items():
+    stage_defaults = copy.deepcopy(DEFAULTS)
+    if stage == "sft":
+        stage_defaults.pop("model")
+        stage_defaults["data"]["train_on_prompt"] = False
+        stage_defaults["train"]["weight_decay"] = 0.1
+    for group, defaults in stage_defaults.items():
         if group not in config:
             config[group] = {}
         if isinstance(config[group], dict):

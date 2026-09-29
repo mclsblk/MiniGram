@@ -59,11 +59,13 @@ class SFTDataset(Dataset):
         tokenizer,
         max_length=512,
         train_on_prompt=False,
+        return_attention_mask=False,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.train_on_prompt = bool(train_on_prompt)
+        self.return_attention_mask = return_attention_mask
         self.data = load_dataset("json", data_files=data_path, split="train")
 
         if self.tokenizer.pad_token_id is None:
@@ -137,9 +139,14 @@ class SFTDataset(Dataset):
         input_ids, labels = self._truncate_with_supervision(input_ids, labels)
         if all(label == -100 for label in labels):
             raise ValueError("SFT sample has no supervised tokens after formatting/truncation.")
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        real_length = len(input_ids)
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - real_length)
         labels += [-100] * (self.max_length - len(labels))
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        example = torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        if self.return_attention_mask:
+            attention_mask = torch.arange(self.max_length) < real_length
+            return (*example, attention_mask)
+        return example
 
     def __getitem__(self, idx):
         last_error = None

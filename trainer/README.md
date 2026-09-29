@@ -1,6 +1,6 @@
-# TOML 驱动的 pretrain
+# TOML 驱动的 pretrain 与 SFT
 
-当前只有 `01_pretrain.py` 已迁移到新版共享接口。SFT、LoRA、GRPO 仍待迁移；不兼容旧模型权重及旧 Engram 参数。
+`01_pretrain.py` 与 `02_sft.py` 已接入新版共享接口。LoRA、GRPO 仍待迁移；不兼容旧模型权重及旧 Engram 参数。
 
 ## 启动与参数
 
@@ -51,3 +51,30 @@ python -m unittest trainer.test_pretrain -v
 测试覆盖配置解析、10 种合法组合的普通 FFN／MoE 更新、映射与严格权重加载、优化器恢复、非首 epoch 续训、尾部窗口及单 batch 保存。有 CUDA 时额外检查 BF16／FP16。旧 `tests/test_engram_smoke.py` 不属于新版测试入口。
 
 `runtime.use_compile` 默认 false；compression 就绪检查及 MoE 动态路由可能产生 graph break。上述训练检查不代替完整的增量 decode、beam reorder 或参考算法验收。
+
+
+## SFT：从新版权重开始
+
+SFT 使用 `configs/sft.toml`，`stage="sft"`，包含 data、train、runtime、output，不接受 model 分组。模型结构、Engram 预设及映射均来自 checkpoint，加载时不重新生成 compression。tokenizer 从配置加载，词表大小及 BOS／EOS／PAD 必须与保存配置一致；不做内容指纹校验。数据长度不得超过 checkpoint 的模型位置上限。
+
+首次 SFT 必须指定 `--init_from`，只使用模型配置与权重，重新建立 optimizer、scaler 和训练进度。`--resume_from` 只接受 SFT 完整训练 checkpoint。两者必须且只能传一个，路径相对当前目录；不提供随机初始化入口。
+
+```bash
+python trainer/02_sft.py --config configs/sft.toml \
+  --init_from trainer/out/minigram_pretrain.pth
+python trainer/02_sft.py --config configs/sft.toml \
+  --init_from trainer/out/minigram_pretrain.pth --batch_size 4 --learning_rate 0.00005
+python trainer/02_sft.py --config configs/sft.toml \
+  --resume_from trainer/out/checkpoint/minigram_sft.pth
+
+torchrun --standalone --nproc_per_node=2 trainer/02_sft.py \
+  --config configs/sft.toml --init_from trainer/out/minigram_pretrain.pth
+```
+
+`data.train_on_prompt=false` 默认仅监督 assistant；设为 true 时监督全部真实 token。对话格式化、随机身份系统提示和截断逻辑保持原有行为。SFTDataset 在 SFT 入口返回独立 attention_mask，按截断后的实际长度在 padding 前生成，因此 prompt 仍参与 attention／Engram，且 PAD 与 EOS 共用 ID 时不会误屏蔽真实 EOS。默认 dataset 返回仍为 input_ids、labels，未迁移的调用方不必因这次 mask 增加而改动。
+
+SFT 保留 shuffle 和 drop_last=True。DDP sampler 每 epoch 设置 epoch；单进程按 seed+epoch 重设 DataLoader generator。续训重建对应 epoch 的采样顺序并跳过已完成批次。没有保存 RNG，dropout 与随机系统提示不保证逐步复现。数据文件和 tokenizer 内容应保持一致。
+
+输出默认是 `trainer/out/minigram_sft.pth`（模型导出）、`trainer/out/checkpoint/minigram_sft.pth`（完整续训状态），以及实际生效配置 `resolved_config.json`。保存采用临时文件加原子替换；累积中途的请求延迟到窗口结束，尾部窗口按实际批次数归一化。恢复校验 SFT stage、train/data 设置、world size、每 epoch 批次数及下一批位置；更换训练设置应使用 init_from 开始新的训练，而非 resume_from。
+
+公共接口新增 `create_model_from_checkpoint(path, tokenizer)`，返回严格恢复的模型及已读取 checkpoint；`restore_training_state(state, optimizer, scaler)` 恢复其训练状态。原有 pretrain `load_checkpoint` 接口保持不变。`validate_progress` 移入 train_utils，两入口复用；没有新增通用 Trainer。

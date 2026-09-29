@@ -160,19 +160,65 @@ def save_checkpoint(path, model, optimizer=None, scaler=None, step=None, train_c
         temporary.unlink(missing_ok=True)
 
 
-def load_checkpoint(path, model, optimizer=None, scaler=None):
-    """Strictly load matching new-model weights, optionally restoring training state."""
+def _read_checkpoint(path):
     state = torch.load(path, map_location="cpu", weights_only=True)
-    raw = unwrap_model(model)
     if not isinstance(state, dict) or not {"config", "model"} <= state.keys():
         raise ValueError("Expected a .pth containing config and model; old weights are unsupported")
+    return state
+
+
+def restore_training_state(state, optimizer, scaler=None):
+    """Restore optimizer/scaler from an already read training checkpoint."""
+    if not {"optimizer", "scaler", "step", "train_config"} <= state.keys():
+        raise ValueError("Resuming requires a training checkpoint, not a model-only export")
+    optimizer.load_state_dict(state["optimizer"])
+    if scaler is not None and state["scaler"] is not None:
+        scaler.load_state_dict(state["scaler"])
+
+
+def _load_model_state(state, model):
+    raw = unwrap_model(model)
     if json.loads(json.dumps(state["config"])) != json.loads(json.dumps(raw.config.to_dict())):
         raise ValueError("Checkpoint model config mismatch")
-    if optimizer is not None and not {"optimizer", "scaler", "step", "train_config"} <= state.keys():
-        raise ValueError("Resuming requires a training checkpoint, not a model-only export")
     raw.load_state_dict(state["model"], strict=True)
+
+
+def load_checkpoint(path, model, optimizer=None, scaler=None):
+    """Strictly load matching new-model weights, optionally restoring training state."""
+    state = _read_checkpoint(path)
+    _load_model_state(state, model)
     if optimizer is not None:
-        optimizer.load_state_dict(state["optimizer"])
-        if scaler is not None and state["scaler"] is not None:
-            scaler.load_state_dict(state["scaler"])
+        restore_training_state(state, optimizer, scaler)
     return state
+
+
+def create_model_from_checkpoint(path, tokenizer):
+    """Use saved architecture and mappings; return model and state for optional resume."""
+    state = _read_checkpoint(path)
+    config = MiniGramConfig(**state["config"])
+    expected = {"vocab_size": len(tokenizer), "bos_token_id": tokenizer.bos_token_id,
+                "eos_token_id": tokenizer.eos_token_id, "pad_token_id": tokenizer.pad_token_id}
+    for name, value in expected.items():
+        if getattr(config, name) != value:
+            raise ValueError(f"Tokenizer {name} does not match checkpoint configuration")
+    model = create_model(config, tokenizer, prepare_mapping=False)
+    _load_model_state(state, model)
+    return model, state
+
+
+def validate_progress(progress, steps_per_epoch, epochs, accumulation_steps):
+    fields = ("epoch", "epoch_step", "micro_step", "optimizer_step")
+    if set(progress) != set(fields) or any(type(progress[k]) is not int or progress[k] < 0 for k in fields):
+        raise ValueError("Invalid checkpoint progress")
+    epoch, step = progress["epoch"], progress["epoch_step"]
+    if epoch > epochs or step >= steps_per_epoch or (epoch == epochs and step != 0):
+        raise ValueError("Checkpoint next-batch position is outside the training schedule")
+    if step % accumulation_steps:
+        raise ValueError("Checkpoint is not at an accumulation boundary")
+    if progress["micro_step"] != epoch * steps_per_epoch + step:
+        raise ValueError("Checkpoint micro_step and next-batch position disagree")
+    max_updates = epoch * ((steps_per_epoch + accumulation_steps - 1) // accumulation_steps) + step // accumulation_steps
+    if progress["optimizer_step"] > max_updates:
+        raise ValueError("Checkpoint optimizer_step exceeds completed accumulation windows")
+
+

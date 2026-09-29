@@ -1,4 +1,4 @@
-"""TOML-driven pretraining. SFT/GRPO migrate to the shared APIs separately."""
+"""TOML-driven pretraining. SFT shares configuration, model and checkpoint utilities."""
 import argparse
 import copy
 import json
@@ -23,7 +23,7 @@ from trainer.ddp_utils import (
 )
 from trainer.train_utils import (
     build_amp, build_model_config, create_model, get_lr, get_param, get_remaining_time,
-    load_checkpoint, load_tokenizer, log, log_train_metrics, save_checkpoint, set_seed,
+    load_checkpoint, load_tokenizer, log, log_train_metrics, save_checkpoint, set_seed, validate_progress,
 )
 
 
@@ -37,22 +37,6 @@ def parse_args(argv=None):
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument("--epochs", type=int)
     return parser.parse_args(argv)
-
-
-def validate_progress(progress, steps_per_epoch, epochs, accumulation_steps):
-    fields = ("epoch", "epoch_step", "micro_step", "optimizer_step")
-    if set(progress) != set(fields) or any(type(progress[k]) is not int or progress[k] < 0 for k in fields):
-        raise ValueError("Invalid checkpoint progress")
-    epoch, step = progress["epoch"], progress["epoch_step"]
-    if epoch > epochs or step >= steps_per_epoch or (epoch == epochs and step != 0):
-        raise ValueError("Checkpoint next-batch position is outside the training schedule")
-    if step % accumulation_steps:
-        raise ValueError("Checkpoint is not at an accumulation boundary")
-    if progress["micro_step"] != epoch * steps_per_epoch + step:
-        raise ValueError("Checkpoint micro_step and next-batch position disagree")
-    max_updates = epoch * ((steps_per_epoch + accumulation_steps - 1) // accumulation_steps) + step // accumulation_steps
-    if progress["optimizer_step"] > max_updates:
-        raise ValueError("Checkpoint optimizer_step exceeds completed accumulation windows")
 
 
 def train(config, resume_from, ddp_state):
