@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import os
 import random
-from dataset.chat_utils import inject_system_prompt, normalize_conversations, render_chat_prompt
+from dataset.chat_utils import inject_system_prompt, normalize_conversations, render_chat_prompt, stringify_content
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -180,7 +180,7 @@ class GRPODataset(Dataset):
         reference = ""
         prompt_conversations = conversations
         if conversations and conversations[-1].get("role") == "assistant":
-            reference = conversations[-1].get("content") or ""
+            reference = stringify_content(conversations[-1].get("content"))
             prompt_conversations = conversations[:-1]
 
         messages, tools = normalize_conversations(prompt_conversations)

@@ -44,6 +44,9 @@ DEFAULTS = {"model": {}, "runtime": {"device": "auto", "use_compile": False},
             "train": {"weight_decay": 0.01}, "data": {"num_workers": 0}}
 CLI_FIELDS = {"device": ("runtime", "device"), "save_dir": ("output", "save_dir"),
               **{key: ("train", key) for key in ("batch_size", "learning_rate", "epochs")}}
+GRPO_FIELDS = {"num_generations": int, "max_new_tokens": int, "num_iterations": int,
+               "beta": float, "epsilon": float}
+REWARD_FIELDS = {"model_path": str, "model_name": str, "max_length": int}
 
 
 def _check_fields(values, schema, prefix):
@@ -66,12 +69,16 @@ def _check_fields(values, schema, prefix):
 
 
 def validate_train_config(config, stage="pretrain"):
-    if stage not in ("pretrain", "sft") or config.get("stage") != stage:
+    if stage not in ("pretrain", "sft", "grpo") or config.get("stage") != stage:
         raise ValueError(f"stage: expected supported stage {stage!r}")
     stage_schema = dict(SCHEMA)
     if stage == "sft":
         stage_schema.pop("model")
         stage_schema["data"] = {**SCHEMA["data"], "train_on_prompt": bool}
+    elif stage == "grpo":
+        stage_schema.pop("model")
+        stage_schema["train"] = {**SCHEMA["train"], "max_steps": int}
+        stage_schema.update(grpo=GRPO_FIELDS, reward=REWARD_FIELDS)
     unknown = set(config) - {"stage", *stage_schema}
     if unknown:
         raise ValueError(f"Unknown configuration fields: {sorted(unknown)}")
@@ -84,6 +91,9 @@ def validate_train_config(config, stage="pretrain"):
         "train": tuple(SCHEMA["train"]), "output": tuple(SCHEMA["output"]),
         "runtime": tuple(SCHEMA["runtime"]),
     }
+    if stage == "grpo":
+        required.update(grpo=tuple(GRPO_FIELDS), reward=("max_length",))
+        required["train"] = tuple(stage_schema["train"])
     for group, fields in required.items():
         for field in fields:
             if field not in config[group]:
@@ -105,7 +115,7 @@ def validate_train_config(config, stage="pretrain"):
         for field in fields:
             if config[group][field] <= 0:
                 raise ValueError(f"{group}.{field}: must be positive")
-    if data["max_length"] < 2:
+    if stage != "grpo" and data["max_length"] < 2:
         raise ValueError("data.max_length: must be at least 2 for shifted labels")
     for group, field in (("data", "num_workers"), ("train", "seed"), ("train", "min_lr"),
                          ("train", "weight_decay"), ("train", "grad_clip")):
@@ -123,6 +133,23 @@ def validate_train_config(config, stage="pretrain"):
     if name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError("output.save_name: expected a filename, not a path")
     if stage == "sft":
+        return config
+    if stage == "grpo":
+        grpo, reward = config["grpo"], config["reward"]
+        if grpo["num_generations"] < 2:
+            raise ValueError("grpo.num_generations: must be at least 2")
+        if grpo["max_new_tokens"] < 1 or grpo["num_iterations"] < 1:
+            raise ValueError("grpo.max_new_tokens and num_iterations: must be positive")
+        if grpo["num_iterations"] > 1 and train["accumulation_steps"] != 1:
+            raise ValueError("Multiple GRPO iterations require train.accumulation_steps=1")
+        if grpo["beta"] < 0 or not 0 < grpo["epsilon"] < 1:
+            raise ValueError("grpo.beta must be nonnegative; epsilon must be in (0, 1)")
+        if train["max_steps"] < 0 or reward["max_length"] < 1:
+            raise ValueError("train.max_steps must be nonnegative; reward.max_length must be positive")
+        if "model_path" in reward and "model_name" in reward:
+            raise ValueError("reward: model_path and model_name are mutually exclusive")
+        if config["runtime"]["use_compile"]:
+            raise ValueError("GRPO does not support runtime.use_compile=true")
         return config
     for field, kind in MODEL_FIELDS.items():
         if kind is int and field in model and model[field] <= 0:
@@ -148,13 +175,20 @@ def load_train_config(path, stage="pretrain"):
         stage_defaults.pop("model")
         stage_defaults["data"]["train_on_prompt"] = False
         stage_defaults["train"]["weight_decay"] = 0.1
+    elif stage == "grpo":
+        stage_defaults.pop("model")
+        stage_defaults["train"].update(weight_decay=0.0, max_steps=0)
+        stage_defaults["reward"] = {"max_length": 1024}
     for group, defaults in stage_defaults.items():
         if group not in config:
             config[group] = {}
         if isinstance(config[group], dict):
             config[group] = {**defaults, **config[group]}
     validate_train_config(config, stage)
-    for group, field in (("data", "data_path"), ("data", "tokenizer_path"), ("output", "save_dir")):
+    paths = [("data", "data_path"), ("data", "tokenizer_path"), ("output", "save_dir")]
+    if stage == "grpo":
+        paths.append(("reward", "model_path"))
+    for group, field in paths:
         if field in config[group]:
             config[group][field] = str((path.parent / Path(config[group][field]).expanduser()).resolve())
     return config

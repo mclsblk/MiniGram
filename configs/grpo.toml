@@ -1,0 +1,43 @@
+# Paths are relative to this file. Architecture and Engram mappings come from init_from.
+stage = "grpo"
+
+[data]
+data_path = "../dataset/rlaif.jsonl"
+tokenizer_path = "../model"
+max_length = 512 # Prompt limit; prompt + completion must fit model.max_length.
+num_workers = 4
+
+[train]
+epochs = 1
+batch_size = 2
+accumulation_steps = 1 # Must be 1 when grpo.num_iterations > 1.
+learning_rate = 0.0000003
+min_lr = 0.00000003
+warmup_ratio = 0.03
+weight_decay = 0.0
+grad_clip = 1.0
+dtype = "bf16"
+seed = 42
+max_steps = 0 # Rollout batch limit; 0 runs all epochs.
+
+[grpo]
+num_generations = 4
+max_new_tokens = 256
+num_iterations = 4
+beta = 0.1 # 0 disables reference loading and KL entirely.
+epsilon = 0.2
+
+[reward]
+max_length = 1024
+# Optional: model_path = "../reward_model" OR model_name = "organization/model".
+# Without either source, only the existing heuristic rewards are used.
+
+[runtime]
+device = "auto"
+use_compile = false # GRPO supports eager, single-process CPU/CUDA only.
+
+[output]
+save_dir = "../trainer/out"
+save_name = "minigram_grpo"
+save_interval = 100
+log_interval = 1

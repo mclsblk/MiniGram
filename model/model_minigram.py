@@ -248,7 +248,7 @@ class FFNofMoE(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.loss_coef = config.aux_loss_coef
         
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, compute_aux_loss=None):
         batch_size, seq_length, hidden_size = x.size()
         x_flat = x.view(-1, hidden_size)
         gate_probs = F.softmax(self.gate(x_flat), dim=-1)
@@ -264,7 +264,8 @@ class FFNofMoE(nn.Module):
                 expert_outputs.index_add_(0, token_indices, expert_output.to(expert_outputs.dtype))
             elif self.training:
                 expert_outputs = expert_outputs + 0.0 * sum(p.sum() for p in expert.parameters())
-        if self.training and self.loss_coef > 0:
+        compute_aux_loss = self.training if compute_aux_loss is None else compute_aux_loss
+        if compute_aux_loss and self.loss_coef > 0:
             load = F.one_hot(topk_indices, self.config.num_experts).float().mean(dim=(0, 1))
             aux_loss = (load * gate_probs.mean(0)).sum() * self.config.num_experts * self.loss_coef
         else:
@@ -280,7 +281,7 @@ class TransformerBlock(nn.Module):
         self.ffn = FFN(config) if not config.use_moe else FFNofMoE(config)
 
     def forward(self, state, channel, engram=None, attention_mask=None, use_cache=False,
-                past_key_value=None, precompute_freqs=None, input_ids=None):
+                past_key_value=None, precompute_freqs=None, input_ids=None, compute_aux_loss=None):
         engram_state = _get_from_cache(past_key_value, "engram")
         token_mask = None
         if attention_mask is not None and attention_mask.dim() == 2:
@@ -302,7 +303,7 @@ class TransformerBlock(nn.Module):
 
         hidden, context = channel.read(state, (self.layer_id, "ffn"))
         if self.use_moe:
-            ffn_output, aux_loss = self.ffn(hidden)
+            ffn_output, aux_loss = self.ffn(hidden, compute_aux_loss=compute_aux_loss)
         else:
             ffn_output = self.ffn(hidden)
             aux_loss = hidden.new_zeros(())
@@ -337,7 +338,8 @@ class MiniGramModel(nn.Module):
     def set_engram_token_map(self, token_map):
         set_engram_token_map(self.engrams, self.config, token_map)
 
-    def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None):
+    def forward(self, input_ids, attention_mask=None, use_cache=False, past_key_values=None,
+                compute_aux_loss=None):
         hidden_states = self.token_embedding(input_ids)
         state = self.channel.initialize(hidden_states)
         new_past_key_values = [] if use_cache else None
@@ -356,7 +358,7 @@ class MiniGramModel(nn.Module):
                 state, channel=self.channel, engram=engram,
                 attention_mask=attention_mask, use_cache=use_cache,
                 past_key_value=past_key_value, precompute_freqs=precompute_freqs,
-                input_ids=input_ids,
+                input_ids=input_ids, compute_aux_loss=compute_aux_loss,
             )
             aux_loss = aux_loss + layer_aux_loss
             if use_cache:
@@ -382,11 +384,11 @@ class MiniGramForCausalLM(PreTrainedModel, GenerationMixin):
         self.model.set_engram_token_map(token_map)
 
     def forward(self, input_ids=None, attention_mask=None, use_cache=None,
-                past_key_values=None, labels=None, logits_to_keep=0, **kwargs):
+                past_key_values=None, labels=None, logits_to_keep=0, compute_aux_loss=None, **kwargs):
         use_cache = self.use_cache if use_cache is None else use_cache
 
         hidden_states, new_past_key_values, aux_loss = self.model(
-            input_ids, attention_mask, use_cache, past_key_values
+            input_ids, attention_mask, use_cache, past_key_values, compute_aux_loss=compute_aux_loss
         )
         logits_hidden_states = hidden_states
         if labels is None and logits_to_keep != 0:

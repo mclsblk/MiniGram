@@ -1,6 +1,6 @@
 # TOML 驱动的 pretrain 与 SFT
 
-`01_pretrain.py` 与 `02_sft.py` 已接入新版共享接口。LoRA、GRPO 仍待迁移；不兼容旧模型权重及旧 Engram 参数。
+`01_pretrain.py`、`02_sft.py` 与 `03_grpo.py` 已接入新版共享接口。LoRA 仍待迁移；不兼容旧模型权重及旧 Engram 参数。GRPO 本版只提供初始化、训练和模型导出。
 
 ## 启动与参数
 
@@ -78,3 +78,30 @@ SFT 保留 shuffle 和 drop_last=True。DDP sampler 每 epoch 设置 epoch；单
 输出默认是 `trainer/out/minigram_sft.pth`（模型导出）、`trainer/out/checkpoint/minigram_sft.pth`（完整续训状态），以及实际生效配置 `resolved_config.json`。保存采用临时文件加原子替换；累积中途的请求延迟到窗口结束，尾部窗口按实际批次数归一化。恢复校验 SFT stage、train/data 设置、world size、每 epoch 批次数及下一批位置；更换训练设置应使用 init_from 开始新的训练，而非 resume_from。
 
 公共接口新增 `create_model_from_checkpoint(path, tokenizer)`，返回严格恢复的模型及已读取 checkpoint；`restore_training_state(state, optimizer, scaler)` 恢复其训练状态。原有 pretrain `load_checkpoint` 接口保持不变。`validate_progress` 移入 train_utils，两入口复用；没有新增通用 Trainer。
+
+## GRPO：从新版权重开始，单进程模型导出
+
+```bash
+python trainer/03_grpo.py --config configs/grpo.toml \
+  --init_from trainer/out/minigram_sft.pth
+python trainer/03_grpo.py --config configs/grpo.toml \
+  --init_from trainer/out/minigram_sft.pth --batch_size 4 --device cuda:0
+```
+
+GRPO 使用 `stage="grpo"`，包含 data、train、runtime、output、grpo、reward，不接受 model 分组。`--config` 和 `--init_from` 必填；CLI 只额外接受 device、save_dir、batch_size、learning_rate、epochs。不提供 resume_from。模型结构、权重和 Engram compression 映射来自新版 checkpoint，加载时不重新生成映射；tokenizer 的词表大小及 BOS／EOS／PAD 必须匹配。data.max_length 为 prompt 上限，与 grpo.max_new_tokens 之和不能超过保存模型的 max_length。
+
+仅支持 CPU/CUDA 单进程，拒绝多进程启动和 use_compile=true。参数保持 FP32，CUDA 使用配置的 autocast，非 CUDA 使用 FP32。prompt 左 padding、左截断；截断保留末尾问题和 assistant 起始标记，但可能丢弃较早的系统提示或历史。
+
+rollout 直接调用模型当前的 attention/Engram cache，按 prompt 连续排列 num_generations 个样本。从完整词表原始分布采样，不提供 temperature、top-p、top-k 或其他 logits 修改。首个 EOS 参与目标，结束后的补齐位置不参与；实际采样出的非 EOS PAD 仍为有效动作。未生成 EOS 的长度截断样本继续参与训练。完整 attention mask 由 rollout 返回，奖励文本只解码有效生成部分。
+
+old logprob 使用 rollout 后的无梯度完整序列重算，在同批 num_iterations 次更新期间固定。reference 为初始模型的冻结副本；beta=0 时不创建 reference，也不计算 KL。组内奖励按总体标准差归一化，等奖励组优势为零；保留 token ratio clipping、reference KL 及逐序列平均。log-softmax、ratio、KL 和 loss 归约使用 FP32，无效位置在指数计算前屏蔽，有效位置的非有限值明确报错。
+
+policy 全程 eval，关闭 dropout，但 current forward 保留梯度并显式计算 MoE 辅助损失。总目标为 `grpo_loss + aux_loss`，沿用 checkpoint 的 aux_loss_coef 和现有完整序列辅助损失公式，不额外排除辅助损失中的 padding 位置。模型 forward 新增 `compute_aux_loss=None`：默认仍由 training 状态决定；GRPO 的 current forward 传 true，rollout、old/reference 传 false。日志分别输出总 loss、GRPO loss 和 aux loss。
+
+grpo.num_generations 至少为 2；num_iterations > 1 时 accumulation_steps 必须为 1。train.max_steps 按 rollout batch 计数，0 表示跑完配置 epochs；LR、日志和保存间隔按策略 micro-step 计数，optimizer_step 只统计实际成功更新。累积窗口在 epoch 或 max_steps 截止处结束，按实际 prompt 样本数加权，处理尾部小 batch 和不足一个窗口的批次；grad_clip=0 禁用裁剪。
+
+reward 默认使用现有非空、长度、重复惩罚和 reference 重叠分数。可选 reward.model_path（相对 TOML 目录的本地目录）或互斥的 reward.model_name（远程模型名称），通过序列分类模型额外评分，仍与启发式分数相加。reward.max_length 限制评分输入。references 必须每个 prompt 一项，非文本内容使用共享文本归一化；非有限 reward model 分数在裁剪前报错。
+
+输出默认为 `trainer/out/minigram_grpo.pth` 和 `resolved_config.json`。模型文件仅包含 config 和完整 state_dict，采用共享原子保存接口，不保存 optimizer、scaler 或进度，不支持断点续训。保存请求延迟到当前 rollout 全部策略迭代与累积窗口结束；训练结束导出最终模型。导出可作为下一次新训练的 init_from。
+
+本次 GRPO 迁移按约定未创建测试套件，未执行测试、模型 forward、生成或训练验证；cache/full-forward 概率一致性、MoE 梯度和 CPU/CUDA 运行行为尚未经本次运行验收。
