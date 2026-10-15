@@ -1,72 +1,55 @@
+"""Structured adapter I/O; the base model stays in its original checkpoint."""
+import json
 import os
+from pathlib import Path
 
 import torch
 
 from model.lora import load_lora_state_dict, lora_state_dict
+from trainer.config_utils import validate_lora_config
 
 
-def lora_config(r, alpha, dropout, target_modules):
-    return {
-        "r": int(r),
-        "alpha": float(alpha),
-        "dropout": float(dropout),
-        "target_modules": list(target_modules),
-    }
-
-
-def validate_lora_config(expected, actual):
-    if expected != actual:
-        raise ValueError(f"LoRA config mismatch. expected={expected}, actual={actual}")
-
-
-def _save(payload, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp_path = path + ".tmp"
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
-
-
-def save_lora_model_only(path, model, name, config, base_checkpoint=None, dtype=None):
-    save_path = os.path.join(path or ".", f"{name}.pth")
-    _save(
-        {
-            "adapter": lora_state_dict(model, dtype=dtype),
-            "lora_config": config,
-            "base_checkpoint": base_checkpoint,
-        },
-        save_path,
-    )
-    return save_path
-
-
-def save_lora_checkpoint(path, model, name, optimizer, step, config, base_checkpoint=None, dtype=None):
-    save_path = os.path.join(path or ".", "checkpoint", f"{name}.pth")
-    _save(
-        {
-            "adapter": lora_state_dict(model, dtype=dtype),
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
-            "step": step,
-            "lora_config": config,
-            "base_checkpoint": base_checkpoint,
-        },
-        save_path,
-    )
-    return save_path
-
-
-def load_lora_adapter(path, model, config=None, map_location="cpu"):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"LoRA checkpoint not found: {path}")
-    state = torch.load(path, map_location=map_location)
-    if "lora_config" in state and config is not None:
-        validate_lora_config(config, state["lora_config"])
-    load_lora_state_dict(model, state["adapter"] if "adapter" in state else state, strict=True)
+def read_lora_adapter(path):
+    state = torch.load(Path(path).expanduser().resolve(), map_location="cpu", weights_only=True)
+    required = {"adapter", "lora_config", "base_checkpoint", "base_config"}
+    if not isinstance(state, dict) or not required <= state.keys():
+        raise ValueError("Expected a structured LoRA adapter with base metadata; old adapters are unsupported")
+    validate_lora_config(state["lora_config"])
+    if not isinstance(state["base_checkpoint"], str) or not state["base_checkpoint"].strip():
+        raise ValueError("LoRA adapter must record its base checkpoint path")
+    if not isinstance(state["base_config"], dict) or not state["base_config"]:
+        raise ValueError("LoRA adapter must record its base model configuration")
+    adapter = state["adapter"]
+    if not isinstance(adapter, dict) or not adapter or any(
+        not isinstance(key, str) or not torch.is_tensor(value) for key, value in adapter.items()
+    ):
+        raise ValueError("LoRA adapter must contain a nonempty tensor state_dict")
     return state
 
 
-def load_lora_checkpoint(path, model, optimizer=None, config=None, map_location="cpu"):
-    state = load_lora_adapter(path, model, config=config, map_location=map_location)
-    if optimizer is not None and state.get("optimizer") is not None:
-        optimizer.load_state_dict(state["optimizer"])
-    step = state.get("step", {})
-    return state, int(step.get("epoch", 0)), int(step.get("epoch_step", 0))
+def load_lora_adapter(state, model, config=None):
+    """Apply an already read adapter after injecting its LoRA layers."""
+    if config is not None and state["lora_config"] != config:
+        raise ValueError("LoRA configuration does not match the adapter")
+    expected = json.loads(json.dumps(model.config.to_dict()))
+    if json.loads(json.dumps(state["base_config"])) != expected:
+        raise ValueError("LoRA base configuration does not match the model")
+    load_lora_state_dict(model, state["adapter"], strict=True)
+
+
+def save_lora_adapter(path, model, config, base_checkpoint):
+    path = Path(path).expanduser().resolve()
+    base_checkpoint = Path(base_checkpoint).expanduser().resolve()
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    if base_checkpoint in (path, temporary):
+        raise ValueError("Adapter output must not overwrite the base checkpoint")
+    state = {
+        "adapter": lora_state_dict(model, dtype=torch.float32), "lora_config": config,
+        "base_checkpoint": str(base_checkpoint), "base_config": model.config.to_dict(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.save(state, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

@@ -47,6 +47,8 @@ CLI_FIELDS = {"device": ("runtime", "device"), "save_dir": ("output", "save_dir"
 GRPO_FIELDS = {"num_generations": int, "max_new_tokens": int, "num_iterations": int,
                "beta": float, "epsilon": float}
 REWARD_FIELDS = {"model_path": str, "model_name": str, "max_length": int}
+LORA_FIELDS = {"r": int, "alpha": float, "dropout": float, "target_modules": list}
+LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "out_proj", "gate_proj", "up_proj", "down_proj"}
 
 
 def _check_fields(values, schema, prefix):
@@ -64,17 +66,35 @@ def _check_fields(values, schema, prefix):
             raise ValueError(f"{name}: must be finite")
         if kind is str and not value.strip():
             raise ValueError(f"{name}: must not be empty")
-        if kind is list and any(type(item) is not int for item in value):
-            raise ValueError(f"{name}: expected an integer array")
+        if kind is list:
+            item_type = str if name == "lora.target_modules" else int
+            if any(type(item) is not item_type for item in value):
+                expected = "a string array" if item_type is str else "an integer array"
+                raise ValueError(f"{name}: expected {expected}")
+
+
+def validate_lora_config(config):
+    _check_fields(config, LORA_FIELDS, "lora")
+    if set(config) != set(LORA_FIELDS):
+        raise ValueError("lora: r, alpha, dropout and target_modules are required")
+    if config["r"] <= 0 or config["alpha"] <= 0 or not 0 <= config["dropout"] < 1:
+        raise ValueError("lora: r and alpha must be positive; dropout must be in [0, 1)")
+    targets = config["target_modules"]
+    if not targets or len(set(targets)) != len(targets) or set(targets) - LORA_TARGETS:
+        raise ValueError(f"lora.target_modules: choose unique entries from {sorted(LORA_TARGETS)}")
+    return config
 
 
 def validate_train_config(config, stage="pretrain"):
-    if stage not in ("pretrain", "sft", "grpo") or config.get("stage") != stage:
+    if stage not in ("pretrain", "sft", "grpo", "lora") or config.get("stage") != stage:
         raise ValueError(f"stage: expected supported stage {stage!r}")
     stage_schema = dict(SCHEMA)
-    if stage == "sft":
+    if stage in ("sft", "lora"):
         stage_schema.pop("model")
         stage_schema["data"] = {**SCHEMA["data"], "train_on_prompt": bool}
+        if stage == "lora":
+            stage_schema["train"] = {**SCHEMA["train"], "max_steps": int}
+            stage_schema["lora"] = LORA_FIELDS
     elif stage == "grpo":
         stage_schema.pop("model")
         stage_schema["train"] = {**SCHEMA["train"], "max_steps": int}
@@ -93,6 +113,9 @@ def validate_train_config(config, stage="pretrain"):
     }
     if stage == "grpo":
         required.update(grpo=tuple(GRPO_FIELDS), reward=("max_length",))
+    if stage == "lora":
+        required["lora"] = tuple(LORA_FIELDS)
+    if stage in ("grpo", "lora"):
         required["train"] = tuple(stage_schema["train"])
     for group, fields in required.items():
         for field in fields:
@@ -133,6 +156,13 @@ def validate_train_config(config, stage="pretrain"):
     if name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError("output.save_name: expected a filename, not a path")
     if stage == "sft":
+        return config
+    if stage == "lora":
+        validate_lora_config(config["lora"])
+        if train["max_steps"] < 0:
+            raise ValueError("train.max_steps: must be nonnegative")
+        if config["runtime"]["use_compile"]:
+            raise ValueError("LoRA does not support runtime.use_compile=true")
         return config
     if stage == "grpo":
         grpo, reward = config["grpo"], config["reward"]
@@ -175,6 +205,10 @@ def load_train_config(path, stage="pretrain"):
         stage_defaults.pop("model")
         stage_defaults["data"]["train_on_prompt"] = False
         stage_defaults["train"]["weight_decay"] = 0.1
+    elif stage == "lora":
+        stage_defaults.pop("model")
+        stage_defaults["data"]["train_on_prompt"] = False
+        stage_defaults["train"].update(weight_decay=0.0, max_steps=0)
     elif stage == "grpo":
         stage_defaults.pop("model")
         stage_defaults["train"].update(weight_decay=0.0, max_steps=0)

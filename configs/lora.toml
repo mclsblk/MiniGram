@@ -1,0 +1,38 @@
+# Paths are relative to this file. Base architecture and Engram mappings come from init_from.
+stage = "lora"
+
+[data]
+data_path = "../dataset/lora_exam.jsonl"
+tokenizer_path = "../model"
+max_length = 512
+num_workers = 4
+train_on_prompt = false
+
+[train]
+epochs = 1
+batch_size = 16
+accumulation_steps = 8
+learning_rate = 0.0001
+min_lr = 0.00001
+warmup_ratio = 0.03
+weight_decay = 0.0
+grad_clip = 1.0 # 0 disables gradient clipping.
+dtype = "bf16"
+seed = 42
+max_steps = 0 # Micro-batch limit; 0 runs all epochs. No resume state is saved.
+
+[lora]
+r = 8
+alpha = 16.0
+dropout = 0.05
+target_modules = ["q_proj", "v_proj"] # Attention/FFN projections only; lm_head is excluded.
+
+[runtime]
+device = "auto"
+use_compile = false # LoRA supports eager, single-process CPU/CUDA only.
+
+[output]
+save_dir = "../trainer/out"
+save_name = "minigram_lora" # Adapter only; retain the original base checkpoint for merging.
+save_interval = 1000
+log_interval = 100
