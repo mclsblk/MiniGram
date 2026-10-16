@@ -1,0 +1,43 @@
+# Relative file paths are resolved against this file, not the working directory.
+stage = "pretrain"
+
+[data]
+data_path = "../dataset/pretrain_t2t.jsonl"
+tokenizer_path = "../model"
+max_length = 340
+num_workers = 8
+
+[model]
+hidden_size = 512
+num_hidden_layers = 12
+use_moe = false
+use_engrams = false
+engram_variant = "deepseek"
+engram_n_layer_list = [1]
+residual_variant = "single"
+# residual_low_rank is optional; the model chooses min(64, hidden_size).
+
+[model.engram_overrides]
+bucket_size = 1024
+
+[train]
+epochs = 1
+batch_size = 32
+accumulation_steps = 8
+learning_rate = 0.0003
+min_lr = 0.00003
+warmup_ratio = 0.03
+weight_decay = 0.01
+grad_clip = 1.0
+dtype = "bf16"
+seed = 42
+
+[runtime]
+device = "auto"
+use_compile = false
+
+[output]
+save_dir = "../trainer/out"
+save_name = "minigram_pretrain"
+save_interval = 1000
+log_interval = 100

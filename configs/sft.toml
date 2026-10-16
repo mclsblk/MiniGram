@@ -1,0 +1,31 @@
+# Paths are relative to this file. Model architecture comes from the checkpoint.
+stage = "sft"
+
+[data]
+data_path = "../dataset/sft_t2t_mini.jsonl"
+tokenizer_path = "../model"
+max_length = 512
+num_workers = 4
+train_on_prompt = false
+
+[train]
+epochs = 1
+batch_size = 16
+accumulation_steps = 8
+learning_rate = 0.0001
+min_lr = 0.00001
+warmup_ratio = 0.03
+weight_decay = 0.1
+grad_clip = 1.0
+dtype = "bf16"
+seed = 42
+
+[runtime]
+device = "auto"
+use_compile = false
+
+[output]
+save_dir = "../trainer/out"
+save_name = "minigram_sft"
+save_interval = 1000
+log_interval = 100

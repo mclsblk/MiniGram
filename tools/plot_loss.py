@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 
 LOSS_RE = re.compile(
-    r"\((\d+)/\d+\).*?\bloss=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"\bmicro\[(\d+)/\d+\].*?(?<!\S)loss=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?=\s|$)"
 )
 
 
@@ -24,7 +24,7 @@ def parse_loss(log_path: Path):
             losses.append(float(match.group(2)))
 
     if not losses:
-        raise ValueError(f"No loss values found in {log_path}")
+        raise ValueError(f"No 'micro[step/total] ... loss=' records found in {log_path}")
 
     return steps, losses
 
@@ -35,7 +35,7 @@ def plot_loss(log_path: Path, out_path: Path):
     plt.figure(figsize=(10, 5))
     plt.plot(steps, losses, linewidth=1.5)
     plt.title("Training Loss")
-    plt.xlabel("Step")
+    plt.xlabel("Micro-step")
     plt.ylabel("Loss")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

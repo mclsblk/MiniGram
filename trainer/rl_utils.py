@@ -4,77 +4,74 @@ import torch.nn.functional as F
 
 def gather_logprobs(logits, target_ids):
     return torch.gather(
-        F.log_softmax(logits, dim=-1),
-        dim=-1,
+        F.log_softmax(logits.float(), dim=-1), dim=-1,
         index=target_ids.unsqueeze(-1),
     ).squeeze(-1)
 
 
-def compute_per_token_logps(model, input_ids, n_keep, attention_mask=None):
-    if n_keep <= 0:
-        return input_ids.new_empty((input_ids.size(0), 0), dtype=torch.float32)
-
+def compute_per_token_logps(model, input_ids, n_keep, attention_mask=None, compute_aux_loss=False):
+    """Completion logprobs and the auxiliary loss from the same forward."""
+    if not 0 < n_keep < input_ids.size(1):
+        raise ValueError("Logprob computation requires a prompt and a nonempty completion")
     outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        logits_to_keep=n_keep + 1,
-        use_cache=False,
+        input_ids=input_ids, attention_mask=attention_mask,
+        logits_to_keep=n_keep + 1, use_cache=False, compute_aux_loss=compute_aux_loss,
     )
     logits = outputs.logits[:, :-1, :]
-    target_ids = input_ids[:, -n_keep:]
-    return gather_logprobs(logits, target_ids)
-
-
-def build_completion_mask(completion_ids, eos_token_id, pad_token_id=None):
-    mask = torch.ones_like(completion_ids, dtype=torch.float32)
-
-    if eos_token_id is not None:
-        is_eos = completion_ids == eos_token_id
-        eos_idx = torch.full(
-            (completion_ids.size(0),),
-            completion_ids.size(1),
-            dtype=torch.long,
-            device=completion_ids.device,
-        )
-        has_eos = is_eos.any(dim=1)
-        eos_idx[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
-        positions = torch.arange(completion_ids.size(1), device=completion_ids.device).unsqueeze(0)
-        mask = (positions <= eos_idx.unsqueeze(1)).to(dtype=torch.float32)
-
-    if pad_token_id is not None and pad_token_id != eos_token_id:
-        mask = mask * (completion_ids != pad_token_id).to(dtype=torch.float32)
-
-    return mask
+    if attention_mask is not None:
+        logits = logits.masked_fill(~attention_mask[:, -n_keep:, None].bool(), 0)
+    logps = gather_logprobs(logits, input_ids[:, -n_keep:])
+    return logps, outputs.aux_loss.float()
 
 
 def masked_mean(values, mask, dim=None, eps=1e-8):
     mask = mask.to(dtype=values.dtype)
-    return (values * mask).sum(dim=dim) / mask.sum(dim=dim).clamp_min(eps)
+    return values.masked_fill(~mask.bool(), 0).sum(dim=dim) / mask.sum(dim=dim).clamp_min(eps)
 
 
 def group_normalize_rewards(rewards, num_generations, eps=1e-4):
-    grouped_rewards = rewards.view(-1, num_generations)
-    mean = grouped_rewards.mean(dim=1).repeat_interleave(num_generations)
-    std = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(num_generations)
-    return (rewards - mean) / (std + eps)
+    rewards = rewards.float()
+    if rewards.ndim != 1 or rewards.numel() == 0 or num_generations < 2 or rewards.numel() % num_generations:
+        raise ValueError("Rewards must contain complete groups with at least two generations")
+    if not torch.isfinite(rewards).all():
+        raise ValueError("Rewards must be finite")
+    grouped = rewards.view(-1, num_generations)
+    advantages = (grouped - grouped.mean(dim=1, keepdim=True)) / (
+        grouped.std(dim=1, unbiased=False, keepdim=True) + eps
+    )
+    return advantages.reshape(-1)
 
 
 def compute_grpo_loss(
-        per_token_logps, old_per_token_logps, ref_per_token_logps,
-        advantages, completion_mask, beta, epsilon
+    per_token_logps, old_per_token_logps, ref_per_token_logps,
+    advantages, completion_mask, beta, epsilon,
 ):
-    log_ratio = per_token_logps - old_per_token_logps
-    ratio = torch.exp(log_ratio)
+    valid = completion_mask.bool()
+    if not valid.any(dim=1).all():
+        raise ValueError("Every completion must contain at least one valid token")
+    current = per_token_logps.float().masked_fill(~valid, 0)
+    old = old_per_token_logps.detach().float().masked_fill(~valid, 0)
+    advantages = advantages.detach().float()
+    if not (torch.isfinite(current).all() and torch.isfinite(old).all()
+            and torch.isfinite(advantages).all()):
+        raise ValueError("Non-finite GRPO logprobs or advantages at valid positions")
+    ratio = torch.exp(current - old)
     clipped_ratio = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon)
-
-    per_token_kl_delta = ref_per_token_logps - per_token_logps
-    per_token_kl = torch.exp(per_token_kl_delta) - per_token_kl_delta - 1.0
-
-    policy_objective = torch.min(
-        ratio * advantages.unsqueeze(1),
-        clipped_ratio * advantages.unsqueeze(1),
-    )
-    per_token_loss = -(policy_objective - beta * per_token_kl)
-    loss = masked_mean(per_token_loss, completion_mask, dim=1).mean()
-    mean_kl = masked_mean(per_token_kl, completion_mask)
-    return loss, mean_kl
+    if beta > 0:
+        if ref_per_token_logps is None:
+            raise ValueError("A reference policy is required when beta > 0")
+        reference = ref_per_token_logps.detach().float().masked_fill(~valid, 0)
+        if not torch.isfinite(reference).all():
+            raise ValueError("Non-finite reference logprobs at valid positions")
+        delta = reference - current
+        per_token_kl = torch.exp(delta) - delta - 1.0
+    else:
+        per_token_kl = torch.zeros_like(current)
+    if not (torch.isfinite(ratio).all() and torch.isfinite(per_token_kl).all()):
+        raise ValueError("Non-finite GRPO ratio or KL at valid positions")
+    objective = torch.min(ratio * advantages.unsqueeze(1), clipped_ratio * advantages.unsqueeze(1))
+    per_token_loss = -objective + beta * per_token_kl
+    if not torch.isfinite(per_token_loss).all():
+        raise ValueError("Non-finite GRPO objective")
+    loss = masked_mean(per_token_loss, valid, dim=1).mean()
+    return loss, masked_mean(per_token_kl, valid)

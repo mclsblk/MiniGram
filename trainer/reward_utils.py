@@ -1,6 +1,9 @@
+import math
 import re
 
 import torch
+
+from dataset.chat_utils import stringify_content
 
 
 def non_empty_reward(completion):
@@ -65,12 +68,22 @@ def model_reward(prompt, completion, model, tokenizer, max_length=1024):
             inputs = {key: value.to(_model_device(model)) for key, value in inputs.items()}
             outputs = model(**inputs)
             score = _score_from_logits(outputs.logits)[0]
-    return max(min(float(score), 3.0), -3.0)
+    score = float(score)
+    if not math.isfinite(score):
+        raise ValueError("Reward model returned a non-finite score")
+    return max(min(score, 3.0), -3.0)
 
 
 def compute_rewards(prompts, completions, references=None, model=None, tokenizer=None, max_length=1024):
+    if not prompts:
+        raise ValueError("Rewards require at least one prompt")
+    if (model is None) != (tokenizer is None):
+        raise ValueError("Reward model and tokenizer must be provided together")
     if references is None:
-        references = [""] * len(completions)
+        references = [""] * len(prompts)
+    elif len(references) != len(prompts):
+        raise ValueError("References must contain one entry per prompt")
+    references = [stringify_content(reference) for reference in references]
 
     rewards = []
     num_generations = len(completions) // len(prompts)
@@ -80,7 +93,7 @@ def compute_rewards(prompts, completions, references=None, model=None, tokenizer
         for generation_idx in range(num_generations):
             idx = prompt_idx * num_generations + generation_idx
             completion = completions[idx]
-            reference = references[prompt_idx] if prompt_idx < len(references) else ""
+            reference = references[prompt_idx]
             reward = 0.0
             reward += non_empty_reward(completion)
             reward += length_reward(completion)
@@ -88,6 +101,8 @@ def compute_rewards(prompts, completions, references=None, model=None, tokenizer
             reward += reference_overlap_reward(completion, reference)
             if model is not None and tokenizer is not None:
                 reward += model_reward(prompt, completion, model, tokenizer, max_length=max_length)
+            if not math.isfinite(reward):
+                raise ValueError("Non-finite completion reward")
             rewards.append(reward)
 
     return torch.tensor(rewards, dtype=torch.float32)

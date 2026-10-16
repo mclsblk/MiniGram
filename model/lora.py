@@ -94,12 +94,18 @@ def lora_state_dict(model, dtype=None):
 
 def load_lora_state_dict(model, state_dict, strict=True):
     raw_model = _unwrap_model(model)
-    expected = set(lora_state_dict(raw_model).keys())
+    expected = {name: parameter for name, parameter in raw_model.named_parameters()
+                if ".lora_A." in name or ".lora_B." in name}
     found = set(state_dict.keys())
-    missing = sorted(expected - found)
-    unexpected = sorted(found - expected)
+    missing = sorted(expected.keys() - found)
+    unexpected = sorted(found - expected.keys())
     if strict and (missing or unexpected):
         raise RuntimeError(f"LoRA state mismatch. missing={missing}, unexpected={unexpected}")
+    mismatched = sorted(name for name in expected.keys() & found
+                        if not torch.is_tensor(state_dict[name])
+                        or state_dict[name].shape != expected[name].shape)
+    if mismatched:
+        raise RuntimeError(f"LoRA tensor shape mismatch: {mismatched}")
     raw_model.load_state_dict(state_dict, strict=False)
     return {"missing_keys": missing, "unexpected_keys": unexpected}
 
